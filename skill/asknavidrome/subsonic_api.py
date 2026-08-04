@@ -2,6 +2,7 @@ from hashlib import md5
 from typing import Union
 import logging
 import random
+import re
 import secrets
 
 import libsonic
@@ -89,6 +90,16 @@ class SubsonicConnection:
 
         return None
 
+    @staticmethod
+    def _normalize_playlist_name(name: str) -> str:
+        """Lowercase and strip everything but letters/digits, so voice-friendly
+        slot values (e.g. "crossover") can be compared against stylized
+        playlist titles (e.g. "FM-X (The Cross-Over)") without punctuation,
+        spacing or casing getting in the way.
+        """
+
+        return re.sub(r'[^a-z0-9]', '', name.lower())
+
     def search_playlist(self, term: str) -> Union[str, None]:
         """Search the media server for the given playlist
 
@@ -100,9 +111,19 @@ class SubsonicConnection:
         self.logger.debug('In function search_playlist()')
 
         playlist_dict = self.conn.getPlaylists()
+        playlists = playlist_dict['playlists']['playlist']
 
         # Search the list of dictionaries for a playlist with a name that matches the search term
-        playlist_id_list = [item.get('id') for item in playlist_dict['playlists']['playlist'] if item.get('name').lower() == term.lower()]
+        playlist_id_list = [item.get('id') for item in playlists if item.get('name').lower() == term.lower()]
+
+        if not playlist_id_list:
+            # No exact match: fall back to a normalized substring match so
+            # voice-friendly slot values still resolve against stylized
+            # playlist names that contain them (e.g. "crossover" against
+            # "FM-X (The Cross-Over)").
+            normalized_term = self._normalize_playlist_name(term)
+
+            playlist_id_list = [item.get('id') for item in playlists if normalized_term in self._normalize_playlist_name(item.get('name'))]
 
         if len(playlist_id_list) == 1:
             # We have matched the playlist return it

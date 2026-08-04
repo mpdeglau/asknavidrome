@@ -183,8 +183,22 @@ class MediaQueue:
             self.history.append(self.current_track)
             self.current_track = self.queue.popleft()
 
-        # Set the buffer to match the queue
-        self.sync()
+        if not self.buffer:
+            # Nothing buffered yet - e.g. a brand new queue just built via
+            # clear()/add_track(). Do a full resync so PlaybackNearlyFinished
+            # has something to enqueue.
+            self.sync()
+        elif self.buffer[0].id == self.current_track.id:
+            # The buffer was already advanced to this track by an earlier
+            # PlaybackNearlyFinished (the normal case) - drop the matching
+            # front entry to keep buffer and queue in lockstep.
+            self.buffer.popleft()
+        # Otherwise the buffer is already further ahead than this call - e.g.
+        # an intervening PlaybackFinished was missed, or PlaybackFailed/skip
+        # forced an extra advance here. Leave it alone: overwriting it with
+        # `self.sync()` would re-add a track the buffer already dispatched,
+        # and Alexa rejects the resulting duplicate ENQUEUE (stale
+        # expected_previous_token), silently stalling playback.
 
         return self.current_track
 
@@ -218,11 +232,15 @@ class MediaQueue:
         attribute.  This allows Amazon to send the PlaybackNearlyFinished
         request early to queue the next track while maintaining the playlist
 
-        :return: The next track to be played
-        :rtype: Track
+        :return: The next track to be played, or None if the buffer is empty
+            (i.e. the current track is the last one in the queue)
+        :rtype: Track | None
         """
 
         self.logger.debug('In enqueue_next_track()')
+
+        if not self.buffer:
+            return None
 
         return self.buffer.popleft()
 

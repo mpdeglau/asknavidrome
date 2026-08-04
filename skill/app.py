@@ -19,6 +19,18 @@ import asknavidrome.subsonic_api as api
 import asknavidrome.media_queue as queue
 import asknavidrome.controller as controller
 
+
+def resolved_slot_value(slot):
+    """Return a slot's entity-resolved canonical value (e.g. matched via a
+    custom slot type synonym) when available, falling back to the raw
+    spoken/transcribed text otherwise."""
+    if slot.resolutions and slot.resolutions.resolutions_per_authority:
+        for authority in slot.resolutions.resolutions_per_authority:
+            if authority.status.code == 'ER_SUCCESS_MATCH' and authority.values:
+                return authority.values[0].value.name
+    return slot.value
+
+
 # Create web service
 app = Flask(__name__)
 
@@ -188,6 +200,11 @@ logger.debug('MediaQueue object created...')
 # at the same time.
 backgroundProcess = None
 
+# Human-readable description of what's currently loaded into play_queue (e.g.
+# 'the playlist Crossover', 'the album X by Y'), spoken back on resume so
+# the user knows what's about to play.
+current_queue_description = ''
+
 # Connect to Navidrome
 connection = api.SubsonicConnection(navidrome_url,
                                     navidrome_user,
@@ -295,7 +312,7 @@ class NaviSonicPlayMusicByArtist(AbstractRequestHandler):
         return is_intent_name('NaviSonicPlayMusicByArtist')(handler_input)
 
     def handle(self, handler_input: HandlerInput) -> Response:
-        global backgroundProcess
+        global backgroundProcess, current_queue_description
         logger.debug('In NaviSonicPlayMusicByArtist')
 
         # Check if a background process is already running, if it is then terminate the process
@@ -328,6 +345,7 @@ class NaviSonicPlayMusicByArtist(AbstractRequestHandler):
             backgroundProcess = Process(target=queue_worker_thread, args=(connection, play_queue, song_id_list[2:]))  # Create a thread to enqueue the remaining tracks
             backgroundProcess.start()  # Start the additional thread
 
+            current_queue_description = f'music by {artist.value}'
             speech = sanitise_speech_output(f'Playing music by: {artist.value}')
             logger.info(speech)
 
@@ -350,7 +368,7 @@ class NaviSonicPlayAlbumByArtist(AbstractRequestHandler):
         return is_intent_name('NaviSonicPlayAlbumByArtist')(handler_input)
 
     def handle(self, handler_input: HandlerInput) -> Response:
-        global backgroundProcess
+        global backgroundProcess, current_queue_description
         logger.debug('In NaviSonicPlayAlbumByArtist')
 
         # Check if a background process is already running, if it is then terminate the process
@@ -398,6 +416,7 @@ class NaviSonicPlayAlbumByArtist(AbstractRequestHandler):
                 backgroundProcess = Process(target=queue_worker_thread, args=(connection, play_queue, song_id_list[2:]))  # Create a thread to enqueue the remaining tracks
                 backgroundProcess.start()  # Start the additional thread
 
+                current_queue_description = f'the album {album.value} by {artist.value}'
                 speech = sanitise_speech_output(f'Playing {album.value} by: {artist.value}')
                 logger.info(speech)
                 card = {'title': 'AskNavidrome',
@@ -428,6 +447,7 @@ class NaviSonicPlayAlbumByArtist(AbstractRequestHandler):
                 backgroundProcess = Process(target=queue_worker_thread, args=(connection, play_queue, song_id_list[2:]))  # Create a thread to enqueue the remaining tracks
                 backgroundProcess.start()  # Start the additional thread
 
+                current_queue_description = f'the album {album.value}'
                 speech = sanitise_speech_output(f'Playing {album.value}')
                 logger.info(speech)
                 card = {'title': 'AskNavidrome',
@@ -449,6 +469,7 @@ class NaviSonicPlaySongByArtist(AbstractRequestHandler):
         return is_intent_name('NaviSonicPlaySongByArtist')(handler_input)
 
     def handle(self, handler_input: HandlerInput) -> Response:
+        global current_queue_description
         logger.debug('In NaviSonicPlaySongByArtist')
 
         # Get variables from intent
@@ -484,6 +505,7 @@ class NaviSonicPlaySongByArtist(AbstractRequestHandler):
             play_queue.clear()
             controller.enqueue_songs(connection, play_queue, song_dets)
 
+            current_queue_description = f'{song.value} by {artist.value}'
             speech = sanitise_speech_output(f'Playing {song.value} by {artist.value}')
             logger.info(speech)
             card = {'title': 'AskNavidrome',
@@ -504,7 +526,7 @@ class NaviSonicPlayPlaylist(AbstractRequestHandler):
         return is_intent_name('NaviSonicPlayPlaylist')(handler_input)
 
     def handle(self, handler_input: HandlerInput) -> Response:
-        global backgroundProcess
+        global backgroundProcess, current_queue_description
         logger.debug('In NaviSonicPlayPlaylist')
 
         # Check if a background process is already running, if it is then terminate the process
@@ -515,12 +537,13 @@ class NaviSonicPlayPlaylist(AbstractRequestHandler):
 
         # Get the requested playlist
         playlist = get_slot_value_v2(handler_input, 'playlist')
+        playlist_name = resolved_slot_value(playlist)
 
         # Search for a playlist
-        playlist_id = connection.search_playlist(playlist.value)
+        playlist_id = connection.search_playlist(playlist_name)
 
         if playlist_id is None:
-            text = sanitise_speech_output("I couldn't find the playlist " + str(playlist.value) + ' in the collection.')
+            text = sanitise_speech_output("I couldn't find the playlist " + str(playlist_name) + ' in the collection.')
             handler_input.response_builder.speak(text).ask(text)
 
             return handler_input.response_builder.response
@@ -534,7 +557,8 @@ class NaviSonicPlayPlaylist(AbstractRequestHandler):
             backgroundProcess = Process(target=queue_worker_thread, args=(connection, play_queue, song_id_list[2:]))  # Create a thread to enqueue the remaining tracks
             backgroundProcess.start()  # Start the additional thread
 
-            speech = sanitise_speech_output('Playing playlist ' + str(playlist.value))
+            current_queue_description = 'the playlist ' + str(playlist_name)
+            speech = sanitise_speech_output('Playing playlist ' + str(playlist_name))
             logger.info(speech)
             card = {'title': 'AskNavidrome',
                     'text': speech
@@ -554,7 +578,7 @@ class NaviSonicPlayMusicByGenre(AbstractRequestHandler):
         return is_intent_name('NaviSonicPlayMusicByGenre')(handler_input)
 
     def handle(self, handler_input: HandlerInput) -> Response:
-        global backgroundProcess
+        global backgroundProcess, current_queue_description
         logger.debug('In NaviSonicPlayMusicByGenre')
 
         # Check if a background process is already running, if it is then terminate the process
@@ -583,6 +607,7 @@ class NaviSonicPlayMusicByGenre(AbstractRequestHandler):
             backgroundProcess = Process(target=queue_worker_thread, args=(connection, play_queue, song_id_list[2:]))  # Create a thread to enqueue the remaining tracks
             backgroundProcess.start()  # Start the additional thread
 
+            current_queue_description = f'{genre.value} music'
             speech = sanitise_speech_output(f'Playing {genre.value} music')
             logger.info(speech)
             card = {'title': 'AskNavidrome',
@@ -603,7 +628,7 @@ class NaviSonicPlayMusicRandom(AbstractRequestHandler):
         return is_intent_name('NaviSonicPlayMusicRandom')(handler_input)
 
     def handle(self, handler_input: HandlerInput) -> Response:
-        global backgroundProcess
+        global backgroundProcess, current_queue_description
         logger.debug('In NaviSonicPlayMusicRandom')
 
         # Check if a background process is already running, if it is then terminate the process
@@ -629,6 +654,7 @@ class NaviSonicPlayMusicRandom(AbstractRequestHandler):
             backgroundProcess = Process(target=queue_worker_thread, args=(connection, play_queue, song_id_list[2:]))  # Create a thread to enqueue the remaining tracks
             backgroundProcess.start()  # Start the additional thread
 
+            current_queue_description = 'random music'
             speech = sanitise_speech_output('Playing random music')
             logger.info(speech)
             card = {'title': 'AskNavidrome',
@@ -649,7 +675,7 @@ class NaviSonicPlayFavouriteSongs(AbstractRequestHandler):
         return is_intent_name('NaviSonicPlayFavouriteSongs')(handler_input)
 
     def handle(self, handler_input: HandlerInput) -> Response:
-        global backgroundProcess
+        global backgroundProcess, current_queue_description
         logger.debug('In NaviSonicPlayFavouriteSongs')
 
         # Check if a background process is already running, if it is then terminate the process
@@ -675,6 +701,7 @@ class NaviSonicPlayFavouriteSongs(AbstractRequestHandler):
             backgroundProcess = Process(target=queue_worker_thread, args=(connection, play_queue, song_id_list[2:]))  # Create a thread to enqueue the remaining tracks
             backgroundProcess.start()  # Start the additional thread
 
+            current_queue_description = 'your favourite tracks'
             speech = sanitise_speech_output('Playing your favourite tracks.')
             logger.info(speech)
             card = {'title': 'AskNavidrome',
@@ -826,6 +853,12 @@ class PlaybackNearlyFinishedHandler(AbstractRequestHandler):
         logger.info('Queuing next track...')
         track_details = play_queue.enqueue_next_track()
 
+        if track_details is None:
+            # Nothing left in the buffer - the current track is the last
+            # one queued, so there's nothing more to enqueue right now.
+            logger.debug('Buffer empty, nothing to enqueue')
+            return handler_input.response_builder.response
+
         return controller.start_playback('continue', None, None, track_details, handler_input)
 
 
@@ -884,19 +917,32 @@ class ResumePlaybackHandler(AbstractRequestHandler):
 
         current_track = play_queue.get_current_track()
 
+        if current_queue_description:
+            text = sanitise_speech_output(f'Now playing {current_queue_description}')
+        else:
+            text = None
+
         if current_track.offset > 0:
             # There is a paused track, continue
             logger.info('Resuming ' + str(current_track.title))
             logger.info('Offset ' + str(current_track.offset))
 
-            return controller.start_playback('play', None, None, current_track, handler_input)
+            return controller.start_playback('play', text, None, current_track, handler_input)
 
         elif play_queue.get_queue_count() > 0 and current_track.offset == 0:
             # No paused tracks but tracks in queue
             logger.info('Resuming - There was no paused track, getting next track from queue')
             track_details = play_queue.get_next_track()
 
-            return controller.start_playback('play', None, None, track_details, handler_input)
+            return controller.start_playback('play', text, None, track_details, handler_input)
+
+        else:
+            # Nothing paused and nothing queued - there's nothing to resume
+            logger.info('Nothing to resume - queue is empty')
+            text = sanitise_speech_output("There's nothing queued to play. Try asking for an album, playlist, or artist.")
+            handler_input.response_builder.speak(text)
+
+            return handler_input.response_builder.response
 
 
 class NextPlaybackHandler(AbstractRequestHandler):
