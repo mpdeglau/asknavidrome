@@ -1,5 +1,6 @@
 from hashlib import md5
 from typing import Union
+from urllib.parse import quote
 import logging
 import random
 import re
@@ -392,6 +393,29 @@ class SubsonicConnection:
         uri = (
             f'{self.server_url}:{self.port}{self.api_location}/stream.view?f=json&v={self.api_version}&c=AskNavidrome&u='
             f'{self.user}&s={salt}&t={auth_token.hexdigest()}&id={id}'
+        )
+
+        return uri
+
+    def get_cover_art_uri(self, cover_art_id: str) -> str:
+        """Create a URI for a given cover art ID
+
+        Creates a URI for the cover art image represented by the given ID.  Authentication
+        details are embedded in the URI, same pattern as get_song_uri().
+
+        :param str cover_art_id: A cover art ID, e.g. from a song's 'coverArt' field
+        :return: A properly formatted URI
+        :rtype: str
+        """
+
+        self.logger.debug('In function get_cover_art_uri()')
+
+        salt = secrets.token_hex(16)
+        auth_token = md5(self.passwd.encode() + salt.encode())
+
+        uri = (
+            f'{self.server_url}:{self.port}{self.api_location}/getCoverArt.view?f=json&v={self.api_version}&c=AskNavidrome&u='
+            f'{self.user}&s={salt}&t={auth_token.hexdigest()}&id={quote(cover_art_id)}'
         )
 
         return uri
