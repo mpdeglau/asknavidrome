@@ -1,5 +1,6 @@
 from datetime import datetime
 from flask import Flask, render_template
+from typing import Union
 import logging
 from multiprocessing import Process
 from multiprocessing.managers import BaseManager
@@ -12,6 +13,7 @@ from ask_sdk_core.dispatch_components import AbstractRequestHandler, AbstractReq
 from ask_sdk_core.utils import is_request_type, is_intent_name, get_slot_value_v2, get_intent_name, get_request_type
 from ask_sdk_core.handler_input import HandlerInput
 from ask_sdk_model import Response
+from ask_sdk_model.ui import StandardCard
 from ask_sdk_core.dispatch_components import AbstractExceptionHandler
 from flask_ask_sdk.skill_adapter import SkillAdapter
 
@@ -341,7 +343,7 @@ class NaviSonicPlayMusicByArtist(AbstractRequestHandler):
             song_id_list = connection.build_song_list_from_albums(artist_album_lookup, min_song_count)
             play_queue.clear()
 
-            controller.enqueue_songs(connection, play_queue, [song_id_list[0], song_id_list[1]])  # When generating the playlist return the first two tracks.
+            controller.enqueue_songs(connection, play_queue, song_id_list[:2])  # When generating the playlist return the first two tracks.
             backgroundProcess = Process(target=queue_worker_thread, args=(connection, play_queue, song_id_list[2:]))  # Create a thread to enqueue the remaining tracks
             backgroundProcess.start()  # Start the additional thread
 
@@ -412,7 +414,7 @@ class NaviSonicPlayAlbumByArtist(AbstractRequestHandler):
                 play_queue.clear()
 
                 # Work around the Amazon / Alexa 8 second timeout.
-                controller.enqueue_songs(connection, play_queue, [song_id_list[0], song_id_list[1]])  # When generating the playlist return the first two tracks.
+                controller.enqueue_songs(connection, play_queue, song_id_list[:2])  # When generating the playlist return the first two tracks.
                 backgroundProcess = Process(target=queue_worker_thread, args=(connection, play_queue, song_id_list[2:]))  # Create a thread to enqueue the remaining tracks
                 backgroundProcess.start()  # Start the additional thread
 
@@ -431,19 +433,31 @@ class NaviSonicPlayAlbumByArtist(AbstractRequestHandler):
             logger.debug(f'Searching for the album {album.value}')
 
             result = connection.search_album(album.value)
+            song_id_list = connection.build_song_list_from_albums(result, -1) if result is not None else []
 
-            if result is None:
+            if not song_id_list:
+                # Bare "Play {album}" has no carrier word distinguishing it
+                # from a bare song or playlist request, so Alexa's NLU can
+                # route either one here. Before giving up, try the same
+                # term as a song title, then a playlist name. Also covers
+                # Navidrome's catalog search matching some unrelated,
+                # near-empty "album" for a term that was never an album at
+                # all (e.g. a playlist name) - that's not a usable match either.
+                response = find_and_play_bare_term(album.value, handler_input, exclude=frozenset({'album'}))
+
+                if response is not None:
+                    return response
+
                 text = sanitise_speech_output(f"I couldn't find the album {album.value} in the collection.")
                 handler_input.response_builder.speak(text).ask(text)
 
                 return handler_input.response_builder.response
 
             else:
-                song_id_list = connection.build_song_list_from_albums(result, -1)
                 play_queue.clear()
 
                 # Work around the Amazon / Alexa 8 second timeout.
-                controller.enqueue_songs(connection, play_queue, [song_id_list[0], song_id_list[1]])  # When generating the playlist return the first two tracks.
+                controller.enqueue_songs(connection, play_queue, song_id_list[:2])  # When generating the playlist return the first two tracks.
                 backgroundProcess = Process(target=queue_worker_thread, args=(connection, play_queue, song_id_list[2:]))  # Create a thread to enqueue the remaining tracks
                 backgroundProcess.start()  # Start the additional thread
 
@@ -476,6 +490,23 @@ class NaviSonicPlaySongByArtist(AbstractRequestHandler):
         artist = get_slot_value_v2(handler_input, 'artist')
         song = get_slot_value_v2(handler_input, 'song')
 
+        if artist is None or not artist.value:
+            # Bare "Play the song {song}" has no carrier word distinguishing
+            # it from a bare album or playlist request, so Alexa's NLU can
+            # route either one here. Before giving up, try the term as a
+            # song title alone, then an album title, then a playlist name.
+            logger.debug(f'Searching for {song.value} with no artist specified')
+
+            response = find_and_play_bare_term(song.value, handler_input)
+
+            if response is not None:
+                return response
+
+            text = sanitise_speech_output(f"I couldn't find {song.value} in the collection.")
+            handler_input.response_builder.speak(text).ask(text)
+
+            return handler_input.response_builder.response
+
         logger.debug(f'Searching for the song {song.value} by {artist.value}')
 
         # Search for the artist
@@ -494,7 +525,7 @@ class NaviSonicPlaySongByArtist(AbstractRequestHandler):
             song_list = connection.search_song(song.value)
 
             # Search for song by given artist.
-            song_dets = [item.get('id') for item in song_list if item.get('artistId') == artist_id]
+            song_dets = [item.get('id') for item in song_list or [] if item.get('artistId') == artist_id]
 
             if not song_dets:
                 text = sanitise_speech_output(f"I couldn't find a song called {song.value} by {artist.value} in the collection.")
@@ -516,6 +547,201 @@ class NaviSonicPlaySongByArtist(AbstractRequestHandler):
             return controller.start_playback('play', speech, card, track_details, handler_input)
 
 
+def find_and_play_song(term: str, handler_input: HandlerInput) -> Union[Response, None]:
+    """Search for a song matching `term` by title alone (no artist filter)
+    and, if found, start playback. See find_and_play_bare_term().
+
+    :param str term: The song title to search for
+    :param HandlerInput handler_input: The Amazon Alexa HandlerInput object
+    :return: An Alexa Response if a matching song was found and started, else None
+    :rtype: Response | None
+    """
+    global current_queue_description
+
+    song_list = connection.search_song(term)
+
+    if not song_list:
+        return None
+
+    song_dets = [item.get('id') for item in song_list]
+
+    play_queue.clear()
+    controller.enqueue_songs(connection, play_queue, song_dets)
+
+    current_queue_description = str(term)
+    speech = sanitise_speech_output(f'Playing {term}')
+    logger.info(speech)
+    card = {'title': 'AskNavidrome',
+            'text': speech
+            }
+    track_details = play_queue.get_next_track()
+
+    return controller.start_playback('play', speech, card, track_details, handler_input)
+
+
+def find_and_play_album(term: str, handler_input: HandlerInput) -> Union[Response, None]:
+    """Search for an album matching `term` by title alone (no artist filter)
+    and, if found, start playback. See find_and_play_bare_term().
+
+    :param str term: The album title to search for
+    :param HandlerInput handler_input: The Amazon Alexa HandlerInput object
+    :return: An Alexa Response if a matching album was found and started, else None
+    :rtype: Response | None
+    """
+    global backgroundProcess, current_queue_description
+
+    result = connection.search_album(term)
+    song_id_list = connection.build_song_list_from_albums(result, -1) if result is not None else []
+
+    if not song_id_list:
+        # A "matched" album with no actual tracks (e.g. bad catalog data)
+        # isn't a usable result either.
+        return None
+
+    play_queue.clear()
+
+    # Work around the Amazon / Alexa 8 second timeout.
+    controller.enqueue_songs(connection, play_queue, song_id_list[:2])  # When generating the playlist return the first two tracks.
+    backgroundProcess = Process(target=queue_worker_thread, args=(connection, play_queue, song_id_list[2:]))  # Create a thread to enqueue the remaining tracks
+    backgroundProcess.start()  # Start the additional thread
+
+    current_queue_description = f'the album {term}'
+    speech = sanitise_speech_output(f'Playing {term}')
+    logger.info(speech)
+    card = {'title': 'AskNavidrome',
+            'text': speech
+            }
+    track_details = play_queue.get_next_track()
+
+    return controller.start_playback('play', speech, card, track_details, handler_input)
+
+
+def find_and_play_bare_term(term: str, handler_input: HandlerInput, exclude: frozenset = frozenset()) -> Union[Response, None]:
+    """Try resolving a bare (no-artist) search term as a song, then an
+    album, then a playlist, returning the first successful match.
+
+    Several intents share the same ambiguous "Play {X}" shape with no
+    carrier word to tell them apart (song title vs. album title vs.
+    playlist name), so Alexa's NLU routing between them is a guess. Rather
+    than trusting that guess, whichever intent it lands on tries every
+    remaining interpretation here before giving up.
+
+    :param str term: The search term, as captured by whichever intent Alexa matched
+    :param HandlerInput handler_input: The Amazon Alexa HandlerInput object
+    :param frozenset exclude: Interpretations to skip (already tried by the caller)
+    :return: An Alexa Response if any interpretation matched and started, else None
+    :rtype: Response | None
+    """
+    finders = (
+        ('song', find_and_play_song),
+        ('album', find_and_play_album),
+        ('playlist', find_and_play_playlist),
+    )
+
+    for kind, finder in finders:
+        if kind in exclude:
+            continue
+
+        response = finder(term, handler_input)
+
+        if response is not None:
+            return response
+
+    return None
+
+
+def speak_playlist_choices(candidate_names: list, handler_input: HandlerInput) -> Response:
+    """Build a clarifying "did you mean X, Y, or Z?" response and keep the
+    session open for the user's follow-up.
+
+    :param list candidate_names: 2+ playlist names to offer as choices
+    :param HandlerInput handler_input: The Amazon Alexa HandlerInput object
+    :return: An Alexa Response asking the user to pick one
+    :rtype: Response
+    """
+    if len(candidate_names) == 2:
+        options = f'{candidate_names[0]}, or {candidate_names[1]}'
+    else:
+        options = ', '.join(candidate_names[:-1]) + f', or {candidate_names[-1]}'
+
+    text = sanitise_speech_output(f'I found a few playlists that might match — did you mean {options}?')
+    handler_input.response_builder.speak(text).ask(text)
+
+    return handler_input.response_builder.response
+
+
+def play_playlist_by_id(playlist_id: str, playlist_name: str, handler_input: HandlerInput) -> Response:
+    """Start playback of a known playlist by id.
+
+    :param str playlist_id: The playlist's id
+    :param str playlist_name: The playlist's display name, used for speech/description
+    :param HandlerInput handler_input: The Amazon Alexa HandlerInput object
+    :return: An Alexa Response
+    :rtype: Response
+    """
+    global backgroundProcess, current_queue_description
+
+    song_id_list = connection.build_song_list_from_playlist(playlist_id)
+
+    if not song_id_list:
+        text = sanitise_speech_output(f'The playlist {playlist_name} is empty. There is nothing to play.')
+        handler_input.response_builder.speak(text).ask(text)
+
+        return handler_input.response_builder.response
+
+    play_queue.clear()
+
+    # Work around the Amazon / Alexa 8 second timeout.
+    controller.enqueue_songs(connection, play_queue, song_id_list[:2])  # When generating the playlist return the first two tracks.
+    backgroundProcess = Process(target=queue_worker_thread, args=(connection, play_queue, song_id_list[2:]))  # Create a thread to enqueue the remaining tracks
+    backgroundProcess.start()  # Start the additional thread
+
+    current_queue_description = 'the playlist ' + str(playlist_name)
+    speech = sanitise_speech_output('Playing playlist ' + str(playlist_name))
+    logger.info(speech)
+    card = {'title': 'AskNavidrome',
+            'text': speech
+            }
+    track_details = play_queue.get_next_track()
+
+    return controller.start_playback('play', speech, card, track_details, handler_input)
+
+
+def find_and_play_playlist(term: str, handler_input: HandlerInput) -> Union[Response, None]:
+    """Search for a playlist matching `term` and, if found, start playback.
+
+    Factored out of NaviSonicPlayPlaylist so other intents whose bare
+    "Play {X}" phrasing is structurally indistinguishable from a playlist
+    request (e.g. NaviSonicPlayAlbumByArtist's bare "Play {album}", with no
+    carrier word to tell Alexa's NLU which intent was meant) can fall back
+    to trying the same term as a playlist name before giving up. Assumes
+    the caller has already handled any in-flight backgroundProcess.
+
+    With dozens of dynamically-named AudioMuse playlists in play, a "best
+    guess" match is no longer safe to play silently when several playlists
+    score similarly close to the spoken term — in that case this asks the
+    user to disambiguate instead of guessing wrong.
+
+    :param str term: The playlist name to search for
+    :param HandlerInput handler_input: The Amazon Alexa HandlerInput object
+    :return: An Alexa Response (playing a match, or asking to disambiguate) if anything close was found, else None
+    :rtype: Response | None
+    """
+    ranked = connection.rank_playlists(term)
+
+    if not ranked or ranked[0][0] < 0.6:
+        return None
+
+    top_score, top_id, top_name = ranked[0]
+
+    if top_score < 0.97 and len(ranked) > 1 and (top_score - ranked[1][0]) < 0.15:
+        close_candidates = [name for score, _, name in ranked[1:3] if (top_score - score) < 0.15]
+
+        return speak_playlist_choices([top_name] + close_candidates, handler_input)
+
+    return play_playlist_by_id(top_id, top_name, handler_input)
+
+
 class NaviSonicPlayPlaylist(AbstractRequestHandler):
     """Handle NaviSonicPlayPlaylist
 
@@ -526,7 +752,7 @@ class NaviSonicPlayPlaylist(AbstractRequestHandler):
         return is_intent_name('NaviSonicPlayPlaylist')(handler_input)
 
     def handle(self, handler_input: HandlerInput) -> Response:
-        global backgroundProcess, current_queue_description
+        global backgroundProcess
         logger.debug('In NaviSonicPlayPlaylist')
 
         # Check if a background process is already running, if it is then terminate the process
@@ -539,33 +765,150 @@ class NaviSonicPlayPlaylist(AbstractRequestHandler):
         playlist = get_slot_value_v2(handler_input, 'playlist')
         playlist_name = resolved_slot_value(playlist)
 
-        # Search for a playlist
-        playlist_id = connection.search_playlist(playlist_name)
+        response = find_and_play_playlist(playlist_name, handler_input)
 
-        if playlist_id is None:
-            text = sanitise_speech_output("I couldn't find the playlist " + str(playlist_name) + ' in the collection.')
+        if response is not None:
+            return response
+
+        text = sanitise_speech_output("I couldn't find the playlist " + str(playlist_name) + ' in the collection.')
+        handler_input.response_builder.speak(text).ask(text)
+
+        return handler_input.response_builder.response
+
+
+def speak_playlist_page(names: list, offset: int, handler_input: HandlerInput, page_size: int = 8) -> Response:
+    """Speak playlist names starting at `offset`, prompting the user to
+    either play one or hear more, and remember position in session
+    attributes so a follow-up "hear more" can continue from here.
+
+    :param list names: All playlist names, in the order to page through
+    :param int offset: Index of the first name to speak this turn
+    :param HandlerInput handler_input: The Amazon Alexa HandlerInput object
+    :param int page_size: How many names to speak per turn
+    :return: An Alexa Response
+    :rtype: Response
+    """
+    page = names[offset:offset + page_size]
+    remaining = len(names) - (offset + len(page))
+
+    intro = f'You have {len(names)} playlists. Here are some: ' if offset == 0 else 'Here are some more: '
+
+    if remaining > 0:
+        prompt = 'Do you want to play one of these, or hear some more?'
+
+        handler_input.attributes_manager.session_attributes = {
+            'playlist_names': names,
+            'playlist_offset': offset + len(page),
+        }
+    else:
+        prompt = "That's all of them. Do you want to play one of these?"
+
+        # Reached the end: nothing left to page through this session.
+        handler_input.attributes_manager.session_attributes = {}
+
+    speech = sanitise_speech_output(intro + ', '.join(page) + '. ' + prompt)
+    logger.info(speech)
+
+    handler_input.response_builder.set_card(
+        StandardCard(title='AskNavidrome Playlists', text='\n'.join(names))
+    )
+    handler_input.response_builder.speak(speech).ask(sanitise_speech_output(prompt))
+
+    return handler_input.response_builder.response
+
+
+class NaviSonicListPlaylists(AbstractRequestHandler):
+    """Handle NaviSonicListPlaylists
+
+    Read back the names of available playlists, to help find the right one
+    among dozens of dynamically-named AudioMuse playlists.
+    """
+
+    def can_handle(self, handler_input: HandlerInput) -> bool:
+        return is_intent_name('NaviSonicListPlaylists')(handler_input)
+
+    def handle(self, handler_input: HandlerInput) -> Response:
+        logger.debug('In NaviSonicListPlaylists')
+
+        names = sorted(item.get('name') for item in connection.get_all_playlists())
+
+        if not names:
+            text = sanitise_speech_output("You don't have any playlists yet.")
+            handler_input.response_builder.speak(text)
+
+            return handler_input.response_builder.response
+
+        return speak_playlist_page(names, 0, handler_input)
+
+
+class NaviSonicHearMorePlaylists(AbstractRequestHandler):
+    """Handle NaviSonicHearMorePlaylists
+
+    Continue reading the playlist list from where NaviSonicListPlaylists
+    (or a previous "hear more") left off, using session attributes to
+    track position.
+    """
+
+    def can_handle(self, handler_input: HandlerInput) -> bool:
+        return is_intent_name('NaviSonicHearMorePlaylists')(handler_input)
+
+    def handle(self, handler_input: HandlerInput) -> Response:
+        logger.debug('In NaviSonicHearMorePlaylists')
+
+        session_attrs = handler_input.attributes_manager.session_attributes
+        names = session_attrs.get('playlist_names')
+        offset = session_attrs.get('playlist_offset', 0)
+
+        if not names:
+            # No list in progress this session (e.g. "hear more" out of the
+            # blue) - start one fresh rather than erroring.
+            names = sorted(item.get('name') for item in connection.get_all_playlists())
+            offset = 0
+
+        return speak_playlist_page(names, offset, handler_input)
+
+
+class NaviSonicFindPlaylist(AbstractRequestHandler):
+    """Handle NaviSonicFindPlaylist
+
+    Search playlist names and descriptions for a mood/genre/keyword match
+    (e.g. "find me an upbeat playlist") and play the best match, or ask
+    which one was meant when several are close.
+    """
+
+    def can_handle(self, handler_input: HandlerInput) -> bool:
+        return is_intent_name('NaviSonicFindPlaylist')(handler_input)
+
+    def handle(self, handler_input: HandlerInput) -> Response:
+        global backgroundProcess
+        logger.debug('In NaviSonicFindPlaylist')
+
+        # Check if a background process is already running, if it is then terminate the process
+        # in favour of the new process.
+        if backgroundProcess is not None:
+            backgroundProcess.terminate()
+            backgroundProcess.join()
+
+        query = get_slot_value_v2(handler_input, 'query')
+
+        results = connection.search_playlists_by_keyword(query.value)
+
+        if not results:
+            text = sanitise_speech_output(f"I couldn't find a playlist matching {query.value}.")
             handler_input.response_builder.speak(text).ask(text)
 
             return handler_input.response_builder.response
 
-        else:
-            song_id_list = connection.build_song_list_from_playlist(playlist_id)
-            play_queue.clear()
+        top_score, top_id, top_name = results[0]
 
-            # Work around the Amazon / Alexa 8 second timeout.
-            controller.enqueue_songs(connection, play_queue, [song_id_list[0], song_id_list[1]])  # When generating the playlist return the first two tracks.
-            backgroundProcess = Process(target=queue_worker_thread, args=(connection, play_queue, song_id_list[2:]))  # Create a thread to enqueue the remaining tracks
-            backgroundProcess.start()  # Start the additional thread
+        # A clear standout (every query word matched, and well ahead of the
+        # next candidate) is confident enough to just play; otherwise ask.
+        if top_score >= 1.0 and (len(results) == 1 or results[1][0] < top_score - 0.3):
+            return play_playlist_by_id(top_id, top_name, handler_input)
 
-            current_queue_description = 'the playlist ' + str(playlist_name)
-            speech = sanitise_speech_output('Playing playlist ' + str(playlist_name))
-            logger.info(speech)
-            card = {'title': 'AskNavidrome',
-                    'text': speech
-                    }
-            track_details = play_queue.get_next_track()
+        candidate_names = [name for _, _, name in results[:3]]
 
-            return controller.start_playback('play', speech, card, track_details, handler_input)
+        return speak_playlist_choices(candidate_names, handler_input)
 
 
 class NaviSonicPlayMusicByGenre(AbstractRequestHandler):
@@ -603,7 +946,7 @@ class NaviSonicPlayMusicByGenre(AbstractRequestHandler):
             play_queue.clear()
 
             # Work around the Amazon / Alexa 8 second timeout.
-            controller.enqueue_songs(connection, play_queue, [song_id_list[0], song_id_list[1]])  # When generating the playlist return the first two tracks.
+            controller.enqueue_songs(connection, play_queue, song_id_list[:2])  # When generating the playlist return the first two tracks.
             backgroundProcess = Process(target=queue_worker_thread, args=(connection, play_queue, song_id_list[2:]))  # Create a thread to enqueue the remaining tracks
             backgroundProcess.start()  # Start the additional thread
 
@@ -650,7 +993,7 @@ class NaviSonicPlayMusicRandom(AbstractRequestHandler):
             play_queue.clear()
 
             # Work around the Amazon / Alexa 8 second timeout.
-            controller.enqueue_songs(connection, play_queue, [song_id_list[0], song_id_list[1]])  # When generating the playlist return the first two tracks.
+            controller.enqueue_songs(connection, play_queue, song_id_list[:2])  # When generating the playlist return the first two tracks.
             backgroundProcess = Process(target=queue_worker_thread, args=(connection, play_queue, song_id_list[2:]))  # Create a thread to enqueue the remaining tracks
             backgroundProcess.start()  # Start the additional thread
 
@@ -697,7 +1040,7 @@ class NaviSonicPlayFavouriteSongs(AbstractRequestHandler):
             play_queue.clear()
 
             # Work around the Amazon / Alexa 8 second timeout.
-            controller.enqueue_songs(connection, play_queue, [song_id_list[0], song_id_list[1]])  # When generating the playlist return the first two tracks.
+            controller.enqueue_songs(connection, play_queue, song_id_list[:2])  # When generating the playlist return the first two tracks.
             backgroundProcess = Process(target=queue_worker_thread, args=(connection, play_queue, song_id_list[2:]))  # Create a thread to enqueue the remaining tracks
             backgroundProcess.start()  # Start the additional thread
 
@@ -1157,6 +1500,9 @@ sb.add_request_handler(NaviSonicPlayMusicByArtist())
 sb.add_request_handler(NaviSonicPlayAlbumByArtist())
 sb.add_request_handler(NaviSonicPlaySongByArtist())
 sb.add_request_handler(NaviSonicPlayPlaylist())
+sb.add_request_handler(NaviSonicListPlaylists())
+sb.add_request_handler(NaviSonicHearMorePlaylists())
+sb.add_request_handler(NaviSonicFindPlaylist())
 sb.add_request_handler(NaviSonicPlayFavouriteSongs())
 sb.add_request_handler(NaviSonicPlayMusicByGenre())
 sb.add_request_handler(NaviSonicPlayMusicRandom())

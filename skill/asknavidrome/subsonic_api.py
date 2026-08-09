@@ -14,6 +14,15 @@ class SubsonicConnection:
     """Class with methods to interact with Subsonic API compatible media servers
     """
 
+    # Words to ignore when scoring a keyword/mood search query, so carrier
+    # phrasing ("find me a playlist about X") and common connectives don't
+    # get treated as meaningful search terms.
+    _KEYWORD_STOPWORDS = frozenset({
+        'a', 'an', 'the', 'and', 'or', 'of', 'to', 'for', 'with', 'about',
+        'me', 'my', 'some', 'something', 'please', 'find', 'suggest',
+        'recommend', 'playlist', 'playlists', 'that', 'is',
+    })
+
     def __init__(self, server_url: str, user: str, passwd: str, port: int, api_location: str, api_version: str) -> None:
         """
         :param str server_url: The URL of the Subsonic API compatible media server
@@ -113,79 +122,103 @@ class SubsonicConnection:
 
         return SubsonicConnection._normalize_playlist_name(re.sub(r'\bplaylists?\b', '', term, flags=re.IGNORECASE))
 
-    def search_playlist(self, term: str) -> Union[str, None]:
-        """Search the media server for the given playlist
-
-        :param str term: The name of the playlist
-        :return: The ID of the playlist or None if the playlist is not found
-        :rtype: str | None
+    @staticmethod
+    def _normalize_words(text: str) -> list:
+        """Lowercase and split into words, stripping punctuation but
+        keeping word boundaries (unlike _normalize_playlist_name, which
+        collapses everything into one contiguous blob). Used for keyword/
+        mood matching against multi-word text like playlist comments.
         """
 
-        self.logger.debug('In function search_playlist()')
+        return re.sub(r'[^a-z0-9\s]', ' ', text.lower()).split()
 
-        playlist_dict = self.conn.getPlaylists()
-        playlists = playlist_dict['playlists']['playlist']
+    def get_all_playlists(self) -> list:
+        """Return every playlist known to the media server.
 
-        # Search the list of dictionaries for a playlist with a name that matches the search term
-        playlist_id_list = [item.get('id') for item in playlists if item.get('name').lower() == term.lower()]
-
-        if not playlist_id_list:
-            # No exact match: fall back to a normalized substring match so
-            # voice-friendly slot values still resolve against stylized
-            # playlist names that contain them (e.g. "crossover" against
-            # "FM-X (The Cross-Over)").
-            normalized_term = self._normalize_search_term(term)
-
-            playlist_id_list = [item.get('id') for item in playlists if normalized_term in self._normalize_playlist_name(item.get('name'))]
-
-        if len(playlist_id_list) == 1:
-            # We have matched the playlist return it
-            self.logger.debug(f'Found playlist {playlist_id_list[0]}')
-
-            return playlist_id_list[0]
-
-        # Neither an exact nor substring match resolved to exactly one
-        # playlist (0 matches, or an ambiguous substring hit against
-        # multiple stylized names). Since AudioMuse names playlists
-        # dynamically, the spoken term is no longer guaranteed to be a
-        # curated synonym, so fall back to closest-match scoring across
-        # every playlist and take the best candidate if it's a confident fit.
-        fuzzy_match = self._fuzzy_match_playlist(term, playlists)
-
-        if fuzzy_match is not None:
-            self.logger.debug(f'Found playlist {fuzzy_match} via fuzzy match')
-
-            return fuzzy_match
-
-        self.logger.error(f'No playlist matching the name {term} was found!')
-
-        return None
-
-    def _fuzzy_match_playlist(self, term: str, playlists: list, threshold: float = 0.6) -> Union[str, None]:
-        """Score every playlist's normalized name against the normalized
-        search term and return the id of the best match, provided it clears
-        `threshold`.
-
-        :param str term: The name of the playlist as spoken/transcribed
-        :param list playlists: Playlist dictionaries as returned by getPlaylists()
-        :param float threshold: Minimum similarity ratio (0-1) to accept a match
-        :return: The ID of the best-matching playlist or None if nothing clears the threshold
-        :rtype: str | None
+        :return: A list of playlist dictionaries (id, name, comment, ...) as returned by getPlaylists()
+        :rtype: list
         """
+
+        self.logger.debug('In function get_all_playlists()')
+
+        return self.conn.getPlaylists()['playlists']['playlist']
+
+    def rank_playlists(self, term: str) -> list:
+        """Score every playlist's name against `term`, best match first.
+
+        Used instead of a plain first-match search so callers can tell an
+        unambiguous match (score close to 1.0, clear of the runner-up) from
+        an ambiguous one (several playlists scoring close together) and
+        decide whether to just play it or ask which one was meant.
+
+        :param str term: The playlist name as spoken/transcribed
+        :return: A list of (score, id, name) tuples sorted by score descending
+        :rtype: list
+        """
+
+        self.logger.debug('In function rank_playlists()')
 
         normalized_term = self._normalize_search_term(term)
 
-        scored = [
-            (difflib.SequenceMatcher(None, normalized_term, self._normalize_playlist_name(item.get('name'))).ratio(), item.get('id'))
-            for item in playlists
-        ]
+        scored = []
 
-        if not scored:
-            return None
+        for item in self.get_all_playlists():
+            name = item.get('name')
+            normalized_name = self._normalize_playlist_name(name)
 
-        best_score, best_id = max(scored, key=lambda pair: pair[0])
+            if normalized_name == normalized_term:
+                score = 1.0
+            elif normalized_term and normalized_term in normalized_name:
+                # A stylized name containing the whole spoken term (e.g.
+                # "crossover" inside "FM-X (The Cross-Over)") is a strong
+                # signal, but not quite as certain as an exact match.
+                score = 0.9
+            else:
+                score = difflib.SequenceMatcher(None, normalized_term, normalized_name).ratio()
 
-        return best_id if best_score >= threshold else None
+            scored.append((score, item.get('id'), name))
+
+        scored.sort(key=lambda entry: entry[0], reverse=True)
+
+        return scored
+
+    def search_playlists_by_keyword(self, term: str, limit: int = 5) -> list:
+        """Search playlist names and descriptions for a mood/genre/keyword
+        match, for discovery-style requests (e.g. "find me an upbeat
+        playlist") rather than requests for a specific playlist by name.
+
+        :param str term: The keyword(s)/mood to search for
+        :param int limit: Maximum number of candidates to return
+        :return: A list of (score, id, name) tuples sorted by score descending, best first
+        :rtype: list
+        """
+
+        self.logger.debug('In function search_playlists_by_keyword()')
+
+        query_words = [word for word in self._normalize_words(term) if word not in self._KEYWORD_STOPWORDS]
+
+        if not query_words:
+            return []
+
+        scored = []
+
+        for item in self.get_all_playlists():
+            name = item.get('name')
+            # AudioMuse auto-generated playlists carry a "_automatic" suffix
+            # that's not part of the descriptive text, and Navidrome's
+            # comment field (when present) holds a human-written blurb
+            # describing the playlist's mood/genre.
+            corpus_words = self._normalize_words(name.replace('_automatic', '') + ' ' + (item.get('comment') or ''))
+
+            word_hits = sum(1 for query_word in query_words if any(query_word in corpus_word for corpus_word in corpus_words))
+            score = word_hits / len(query_words)
+
+            if score > 0:
+                scored.append((score, item.get('id'), name))
+
+        scored.sort(key=lambda entry: entry[0], reverse=True)
+
+        return scored[:limit]
 
     def search_artist(self, term: str) -> Union[dict, None]:
         """Search the media server for the given artist
@@ -349,7 +382,7 @@ class SubsonicConnection:
 
         self.logger.debug('In function build_song_list_from_favourites()')
 
-        favourite_songs = self.conn.getStarred2().get('starred2').get('song')
+        favourite_songs = self.conn.getStarred2().get('starred2').get('song') or []
 
         if len(favourite_songs) > 0:
             song_id_list = [song.get('id') for song in favourite_songs]
