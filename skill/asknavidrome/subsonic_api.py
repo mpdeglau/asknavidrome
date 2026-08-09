@@ -1,6 +1,7 @@
 from hashlib import md5
 from typing import Union
 from urllib.parse import quote
+import difflib
 import logging
 import random
 import re
@@ -101,6 +102,17 @@ class SubsonicConnection:
 
         return re.sub(r'[^a-z0-9]', '', name.lower())
 
+    @staticmethod
+    def _normalize_search_term(term: str) -> str:
+        """As _normalize_playlist_name, but first strips generic carrier
+        words (e.g. "playlist"/"playlists") that AMAZON.SearchQuery can
+        sweep into the slot value from phrasing like "my {playlist}
+        playlist" but that never appear in an actual playlist name, so they
+        don't get treated as part of the search term.
+        """
+
+        return SubsonicConnection._normalize_playlist_name(re.sub(r'\bplaylists?\b', '', term, flags=re.IGNORECASE))
+
     def search_playlist(self, term: str) -> Union[str, None]:
         """Search the media server for the given playlist
 
@@ -122,7 +134,7 @@ class SubsonicConnection:
             # voice-friendly slot values still resolve against stylized
             # playlist names that contain them (e.g. "crossover" against
             # "FM-X (The Cross-Over)").
-            normalized_term = self._normalize_playlist_name(term)
+            normalized_term = self._normalize_search_term(term)
 
             playlist_id_list = [item.get('id') for item in playlists if normalized_term in self._normalize_playlist_name(item.get('name'))]
 
@@ -132,16 +144,48 @@ class SubsonicConnection:
 
             return playlist_id_list[0]
 
-        elif len(playlist_id_list) > 1:
-            # More than one result was returned, this should not be possible
-            self.logger.error(f'More than one playlist called {term} was found, multiple playlists with the same name are not supported')
+        # Neither an exact nor substring match resolved to exactly one
+        # playlist (0 matches, or an ambiguous substring hit against
+        # multiple stylized names). Since AudioMuse names playlists
+        # dynamically, the spoken term is no longer guaranteed to be a
+        # curated synonym, so fall back to closest-match scoring across
+        # every playlist and take the best candidate if it's a confident fit.
+        fuzzy_match = self._fuzzy_match_playlist(term, playlists)
 
+        if fuzzy_match is not None:
+            self.logger.debug(f'Found playlist {fuzzy_match} via fuzzy match')
+
+            return fuzzy_match
+
+        self.logger.error(f'No playlist matching the name {term} was found!')
+
+        return None
+
+    def _fuzzy_match_playlist(self, term: str, playlists: list, threshold: float = 0.6) -> Union[str, None]:
+        """Score every playlist's normalized name against the normalized
+        search term and return the id of the best match, provided it clears
+        `threshold`.
+
+        :param str term: The name of the playlist as spoken/transcribed
+        :param list playlists: Playlist dictionaries as returned by getPlaylists()
+        :param float threshold: Minimum similarity ratio (0-1) to accept a match
+        :return: The ID of the best-matching playlist or None if nothing clears the threshold
+        :rtype: str | None
+        """
+
+        normalized_term = self._normalize_search_term(term)
+
+        scored = [
+            (difflib.SequenceMatcher(None, normalized_term, self._normalize_playlist_name(item.get('name'))).ratio(), item.get('id'))
+            for item in playlists
+        ]
+
+        if not scored:
             return None
 
-        elif len(playlist_id_list) == 0:
-            self.logger.error(f'No playlist matching the name {term} was found!')
+        best_score, best_id = max(scored, key=lambda pair: pair[0])
 
-            return None
+        return best_id if best_score >= threshold else None
 
     def search_artist(self, term: str) -> Union[dict, None]:
         """Search the media server for the given artist
