@@ -1,5 +1,5 @@
 from datetime import datetime
-from flask import Flask, render_template
+from flask import Flask, render_template, request
 from typing import Union
 import logging
 from multiprocessing import Process
@@ -189,23 +189,55 @@ if 'NAVI_DEBUG' in os.environ:
         logger.setLevel(logging.WARNING)
         logger.warning('Log level set to WARNING')
 
-# Create a shareable queue than can be updated by multiple threads to enable larger playlists
-# to be returned in the back ground avoiding the Amazon 8 second timeout
+# Playback state is kept per Alexa device (keyed by device ID) rather than
+# in a single shared queue, so that two Echo devices can each play something
+# different at the same time instead of one hijacking the other's queue.
 BaseManager.register('MediaQueue', queue.MediaQueue)
 manager = BaseManager()
 manager.start()
-play_queue = manager.MediaQueue()
-logger.debug('MediaQueue object created...')
 
-# Variable to store the additional thread used to populate large playlists
-# this is used to avoid concurrency issues if there is an attempt to load multiple playlists
-# at the same time.
-backgroundProcess = None
+# device_id -> MediaQueue (a manager proxy, shareable with queue_worker_thread's
+# background Process)
+play_queues = {}
 
-# Human-readable description of what's currently loaded into play_queue (e.g.
-# 'the playlist Crossover', 'the album X by Y'), spoken back on resume so
-# the user knows what's about to play.
-current_queue_description = ''
+# device_id -> the additional Process used to populate large playlists in the
+# background. Keyed per device to avoid one device's playlist load cancelling
+# another's.
+background_processes = {}
+
+# device_id -> human-readable description of what's currently loaded into
+# that device's queue (e.g. 'the playlist Crossover', 'the album X by Y'),
+# spoken back on resume so the user knows what's about to play.
+queue_descriptions = {}
+
+logger.debug('MediaQueue manager ready...')
+
+
+def get_device_id(handler_input: HandlerInput) -> str:
+    """Return the requesting Alexa device's unique ID.
+
+    Used to key per-device playback state (queue, background process,
+    description) so multiple Echo devices don't share one queue.
+
+    :param HandlerInput handler_input: The Amazon Alexa HandlerInput object
+    :return: The device ID
+    :rtype: str
+    """
+    return handler_input.request_envelope.context.system.device.device_id
+
+
+def get_play_queue(handler_input: HandlerInput):
+    """Get (creating if necessary) the MediaQueue for the requesting device.
+
+    :param HandlerInput handler_input: The Amazon Alexa HandlerInput object
+    :return: The device's MediaQueue
+    """
+    device_id = get_device_id(handler_input)
+
+    if device_id not in play_queues:
+        play_queues[device_id] = manager.MediaQueue()
+
+    return play_queues[device_id]
 
 # Connect to Navidrome
 connection = api.SubsonicConnection(navidrome_url,
@@ -289,6 +321,46 @@ class SkillEventHandler(AbstractRequestHandler):
         return handler_input.response_builder.response
 
 
+HELP_TOPICS = {
+    'playing music': (
+        'You can say things like: play songs by an artist, play the album X by Y, '
+        'play the song X, play some jazz or rock music, play a random selection, '
+        'or play my favourite songs.'
+    ),
+    'finding playlists': (
+        "You can say what playlists do I have, and I'll read some out — say hear some more "
+        'to keep going. Or say find me a playlist about a mood or genre, like upbeat or blues, '
+        "and I'll find one for you. Once you know the name, say play the playlist, followed by the name."
+    ),
+    'playback controls': (
+        'While something is playing, you can say pause, resume, next, previous, shuffle the queue, '
+        "what's playing, or star this song to add it to your favourites."
+    ),
+}
+
+
+def classify_help_topic(text: str) -> Union[str, None]:
+    """Match freeform help-topic text to one of HELP_TOPICS by keyword,
+    rather than relying solely on the interaction model's entity
+    resolution (which can fail for phrasing not in the slot type's
+    synonym list).
+
+    :param str text: The spoken topic, as resolved or raw slot text
+    :return: A key into HELP_TOPICS, or None if nothing matched
+    :rtype: str | None
+    """
+    normalized = text.lower()
+
+    if any(word in normalized for word in ('playlist', 'mood', 'genre')):
+        return 'finding playlists'
+    if any(word in normalized for word in ('control', 'pause', 'skip', 'shuffle', 'resume', 'stop')):
+        return 'playback controls'
+    if any(word in normalized for word in ('music', 'play', 'song', 'album', 'artist')):
+        return 'playing music'
+
+    return None
+
+
 class HelpHandler(AbstractRequestHandler):
     """Handle HelpIntent"""
 
@@ -298,8 +370,47 @@ class HelpHandler(AbstractRequestHandler):
     def handle(self, handler_input: HandlerInput) -> Response:
         logger.debug('In HelpHandler')
 
-        text = sanitise_speech_output('AskNavidrome lets you interact with media servers that offer a Subsonic compatible A.P.I.')
-        handler_input.response_builder.speak(text)
+        text = sanitise_speech_output(
+            'AskNavidrome lets you play music from your collection and control playback. '
+            'I can walk you through playing music, finding playlists, or playback controls. '
+            'Which would you like help with?'
+        )
+        handler_input.response_builder.speak(text).ask(text)
+
+        return handler_input.response_builder.response
+
+
+class NaviSonicHelpTopic(AbstractRequestHandler):
+    """Handle NaviSonicHelpTopic
+
+    Follow-up to AMAZON.HelpIntent - gives focused help on whichever topic
+    the user picked (playing music, finding playlists, or playback
+    controls) instead of one long info dump.
+    """
+
+    def can_handle(self, handler_input: HandlerInput) -> bool:
+        return is_intent_name('NaviSonicHelpTopic')(handler_input)
+
+    def handle(self, handler_input: HandlerInput) -> Response:
+        logger.debug('In NaviSonicHelpTopic')
+
+        topic = get_slot_value_v2(handler_input, 'topic')
+        topic_text = resolved_slot_value(topic)
+
+        matched_topic = classify_help_topic(topic_text)
+
+        if matched_topic is None:
+            text = sanitise_speech_output(
+                "I didn't catch that. You can ask for help with playing music, finding playlists, "
+                'or playback controls - which would you like?'
+            )
+            handler_input.response_builder.speak(text).ask(text)
+
+            return handler_input.response_builder.response
+
+        prompt = 'Would you like help with something else, or are you ready to try it?'
+        text = sanitise_speech_output(f'{HELP_TOPICS[matched_topic]} {prompt}')
+        handler_input.response_builder.speak(text).ask(sanitise_speech_output(prompt))
 
         return handler_input.response_builder.response
 
@@ -314,14 +425,17 @@ class NaviSonicPlayMusicByArtist(AbstractRequestHandler):
         return is_intent_name('NaviSonicPlayMusicByArtist')(handler_input)
 
     def handle(self, handler_input: HandlerInput) -> Response:
-        global backgroundProcess, current_queue_description
         logger.debug('In NaviSonicPlayMusicByArtist')
 
-        # Check if a background process is already running, if it is then terminate the process
-        # in favour of the new process.
-        if backgroundProcess is not None:
-            backgroundProcess.terminate()
-            backgroundProcess.join()
+        device_id = get_device_id(handler_input)
+        play_queue = get_play_queue(handler_input)
+
+        # Check if a background process is already running for this device, if
+        # it is then terminate the process in favour of the new process.
+        existing_process = background_processes.get(device_id)
+        if existing_process is not None:
+            existing_process.terminate()
+            existing_process.join()
 
         # Get the requested artist
         artist = get_slot_value_v2(handler_input, 'artist')
@@ -344,10 +458,10 @@ class NaviSonicPlayMusicByArtist(AbstractRequestHandler):
             play_queue.clear()
 
             controller.enqueue_songs(connection, play_queue, song_id_list[:2])  # When generating the playlist return the first two tracks.
-            backgroundProcess = Process(target=queue_worker_thread, args=(connection, play_queue, song_id_list[2:]))  # Create a thread to enqueue the remaining tracks
-            backgroundProcess.start()  # Start the additional thread
+            background_processes[device_id] = Process(target=queue_worker_thread, args=(connection, play_queue, song_id_list[2:]))  # Create a thread to enqueue the remaining tracks
+            background_processes[device_id].start()  # Start the additional thread
 
-            current_queue_description = f'music by {artist.value}'
+            queue_descriptions[device_id] = f'music by {artist.value}'
             speech = sanitise_speech_output(f'Playing music by: {artist.value}')
             logger.info(speech)
 
@@ -370,14 +484,17 @@ class NaviSonicPlayAlbumByArtist(AbstractRequestHandler):
         return is_intent_name('NaviSonicPlayAlbumByArtist')(handler_input)
 
     def handle(self, handler_input: HandlerInput) -> Response:
-        global backgroundProcess, current_queue_description
         logger.debug('In NaviSonicPlayAlbumByArtist')
 
-        # Check if a background process is already running, if it is then terminate the process
-        # in favour of the new process.
-        if backgroundProcess is not None:
-            backgroundProcess.terminate()
-            backgroundProcess.join()
+        device_id = get_device_id(handler_input)
+        play_queue = get_play_queue(handler_input)
+
+        # Check if a background process is already running for this device, if
+        # it is then terminate the process in favour of the new process.
+        existing_process = background_processes.get(device_id)
+        if existing_process is not None:
+            existing_process.terminate()
+            existing_process.join()
 
         # Get variables from intent
         artist = get_slot_value_v2(handler_input, 'artist')
@@ -415,10 +532,10 @@ class NaviSonicPlayAlbumByArtist(AbstractRequestHandler):
 
                 # Work around the Amazon / Alexa 8 second timeout.
                 controller.enqueue_songs(connection, play_queue, song_id_list[:2])  # When generating the playlist return the first two tracks.
-                backgroundProcess = Process(target=queue_worker_thread, args=(connection, play_queue, song_id_list[2:]))  # Create a thread to enqueue the remaining tracks
-                backgroundProcess.start()  # Start the additional thread
+                background_processes[device_id] = Process(target=queue_worker_thread, args=(connection, play_queue, song_id_list[2:]))  # Create a thread to enqueue the remaining tracks
+                background_processes[device_id].start()  # Start the additional thread
 
-                current_queue_description = f'the album {album.value} by {artist.value}'
+                queue_descriptions[device_id] = f'the album {album.value} by {artist.value}'
                 speech = sanitise_speech_output(f'Playing {album.value} by: {artist.value}')
                 logger.info(speech)
                 card = {'title': 'AskNavidrome',
@@ -458,10 +575,10 @@ class NaviSonicPlayAlbumByArtist(AbstractRequestHandler):
 
                 # Work around the Amazon / Alexa 8 second timeout.
                 controller.enqueue_songs(connection, play_queue, song_id_list[:2])  # When generating the playlist return the first two tracks.
-                backgroundProcess = Process(target=queue_worker_thread, args=(connection, play_queue, song_id_list[2:]))  # Create a thread to enqueue the remaining tracks
-                backgroundProcess.start()  # Start the additional thread
+                background_processes[device_id] = Process(target=queue_worker_thread, args=(connection, play_queue, song_id_list[2:]))  # Create a thread to enqueue the remaining tracks
+                background_processes[device_id].start()  # Start the additional thread
 
-                current_queue_description = f'the album {album.value}'
+                queue_descriptions[device_id] = f'the album {album.value}'
                 speech = sanitise_speech_output(f'Playing {album.value}')
                 logger.info(speech)
                 card = {'title': 'AskNavidrome',
@@ -483,8 +600,10 @@ class NaviSonicPlaySongByArtist(AbstractRequestHandler):
         return is_intent_name('NaviSonicPlaySongByArtist')(handler_input)
 
     def handle(self, handler_input: HandlerInput) -> Response:
-        global current_queue_description
         logger.debug('In NaviSonicPlaySongByArtist')
+
+        device_id = get_device_id(handler_input)
+        play_queue = get_play_queue(handler_input)
 
         # Get variables from intent
         artist = get_slot_value_v2(handler_input, 'artist')
@@ -536,7 +655,7 @@ class NaviSonicPlaySongByArtist(AbstractRequestHandler):
             play_queue.clear()
             controller.enqueue_songs(connection, play_queue, song_dets)
 
-            current_queue_description = f'{song.value} by {artist.value}'
+            queue_descriptions[device_id] = f'{song.value} by {artist.value}'
             speech = sanitise_speech_output(f'Playing {song.value} by {artist.value}')
             logger.info(speech)
             card = {'title': 'AskNavidrome',
@@ -556,7 +675,8 @@ def find_and_play_song(term: str, handler_input: HandlerInput) -> Union[Response
     :return: An Alexa Response if a matching song was found and started, else None
     :rtype: Response | None
     """
-    global current_queue_description
+    device_id = get_device_id(handler_input)
+    play_queue = get_play_queue(handler_input)
 
     song_list = connection.search_song(term)
 
@@ -568,7 +688,7 @@ def find_and_play_song(term: str, handler_input: HandlerInput) -> Union[Response
     play_queue.clear()
     controller.enqueue_songs(connection, play_queue, song_dets)
 
-    current_queue_description = str(term)
+    queue_descriptions[device_id] = str(term)
     speech = sanitise_speech_output(f'Playing {term}')
     logger.info(speech)
     card = {'title': 'AskNavidrome',
@@ -588,7 +708,8 @@ def find_and_play_album(term: str, handler_input: HandlerInput) -> Union[Respons
     :return: An Alexa Response if a matching album was found and started, else None
     :rtype: Response | None
     """
-    global backgroundProcess, current_queue_description
+    device_id = get_device_id(handler_input)
+    play_queue = get_play_queue(handler_input)
 
     result = connection.search_album(term)
     song_id_list = connection.build_song_list_from_albums(result, -1) if result is not None else []
@@ -602,10 +723,10 @@ def find_and_play_album(term: str, handler_input: HandlerInput) -> Union[Respons
 
     # Work around the Amazon / Alexa 8 second timeout.
     controller.enqueue_songs(connection, play_queue, song_id_list[:2])  # When generating the playlist return the first two tracks.
-    backgroundProcess = Process(target=queue_worker_thread, args=(connection, play_queue, song_id_list[2:]))  # Create a thread to enqueue the remaining tracks
-    backgroundProcess.start()  # Start the additional thread
+    background_processes[device_id] = Process(target=queue_worker_thread, args=(connection, play_queue, song_id_list[2:]))  # Create a thread to enqueue the remaining tracks
+    background_processes[device_id].start()  # Start the additional thread
 
-    current_queue_description = f'the album {term}'
+    queue_descriptions[device_id] = f'the album {term}'
     speech = sanitise_speech_output(f'Playing {term}')
     logger.info(speech)
     card = {'title': 'AskNavidrome',
@@ -679,7 +800,8 @@ def play_playlist_by_id(playlist_id: str, playlist_name: str, handler_input: Han
     :return: An Alexa Response
     :rtype: Response
     """
-    global backgroundProcess, current_queue_description
+    device_id = get_device_id(handler_input)
+    play_queue = get_play_queue(handler_input)
 
     song_id_list = connection.build_song_list_from_playlist(playlist_id)
 
@@ -693,10 +815,10 @@ def play_playlist_by_id(playlist_id: str, playlist_name: str, handler_input: Han
 
     # Work around the Amazon / Alexa 8 second timeout.
     controller.enqueue_songs(connection, play_queue, song_id_list[:2])  # When generating the playlist return the first two tracks.
-    backgroundProcess = Process(target=queue_worker_thread, args=(connection, play_queue, song_id_list[2:]))  # Create a thread to enqueue the remaining tracks
-    backgroundProcess.start()  # Start the additional thread
+    background_processes[device_id] = Process(target=queue_worker_thread, args=(connection, play_queue, song_id_list[2:]))  # Create a thread to enqueue the remaining tracks
+    background_processes[device_id].start()  # Start the additional thread
 
-    current_queue_description = 'the playlist ' + str(playlist_name)
+    queue_descriptions[device_id] = 'the playlist ' + str(playlist_name)
     speech = sanitise_speech_output('Playing playlist ' + str(playlist_name))
     logger.info(speech)
     card = {'title': 'AskNavidrome',
@@ -715,7 +837,8 @@ def find_and_play_playlist(term: str, handler_input: HandlerInput) -> Union[Resp
     request (e.g. NaviSonicPlayAlbumByArtist's bare "Play {album}", with no
     carrier word to tell Alexa's NLU which intent was meant) can fall back
     to trying the same term as a playlist name before giving up. Assumes
-    the caller has already handled any in-flight backgroundProcess.
+    the caller has already handled any in-flight background process for
+    this device.
 
     With dozens of dynamically-named AudioMuse playlists in play, a "best
     guess" match is no longer safe to play silently when several playlists
@@ -752,14 +875,16 @@ class NaviSonicPlayPlaylist(AbstractRequestHandler):
         return is_intent_name('NaviSonicPlayPlaylist')(handler_input)
 
     def handle(self, handler_input: HandlerInput) -> Response:
-        global backgroundProcess
         logger.debug('In NaviSonicPlayPlaylist')
 
-        # Check if a background process is already running, if it is then terminate the process
-        # in favour of the new process.
-        if backgroundProcess is not None:
-            backgroundProcess.terminate()
-            backgroundProcess.join()
+        device_id = get_device_id(handler_input)
+
+        # Check if a background process is already running for this device, if
+        # it is then terminate the process in favour of the new process.
+        existing_process = background_processes.get(device_id)
+        if existing_process is not None:
+            existing_process.terminate()
+            existing_process.join()
 
         # Get the requested playlist
         playlist = get_slot_value_v2(handler_input, 'playlist')
@@ -880,14 +1005,16 @@ class NaviSonicFindPlaylist(AbstractRequestHandler):
         return is_intent_name('NaviSonicFindPlaylist')(handler_input)
 
     def handle(self, handler_input: HandlerInput) -> Response:
-        global backgroundProcess
         logger.debug('In NaviSonicFindPlaylist')
 
-        # Check if a background process is already running, if it is then terminate the process
-        # in favour of the new process.
-        if backgroundProcess is not None:
-            backgroundProcess.terminate()
-            backgroundProcess.join()
+        device_id = get_device_id(handler_input)
+
+        # Check if a background process is already running for this device, if
+        # it is then terminate the process in favour of the new process.
+        existing_process = background_processes.get(device_id)
+        if existing_process is not None:
+            existing_process.terminate()
+            existing_process.join()
 
         query = get_slot_value_v2(handler_input, 'query')
 
@@ -921,14 +1048,17 @@ class NaviSonicPlayMusicByGenre(AbstractRequestHandler):
         return is_intent_name('NaviSonicPlayMusicByGenre')(handler_input)
 
     def handle(self, handler_input: HandlerInput) -> Response:
-        global backgroundProcess, current_queue_description
         logger.debug('In NaviSonicPlayMusicByGenre')
 
-        # Check if a background process is already running, if it is then terminate the process
-        # in favour of the new process.
-        if backgroundProcess is not None:
-            backgroundProcess.terminate()
-            backgroundProcess.join()
+        device_id = get_device_id(handler_input)
+        play_queue = get_play_queue(handler_input)
+
+        # Check if a background process is already running for this device, if
+        # it is then terminate the process in favour of the new process.
+        existing_process = background_processes.get(device_id)
+        if existing_process is not None:
+            existing_process.terminate()
+            existing_process.join()
 
         # Get the requested genre
         genre = get_slot_value_v2(handler_input, 'genre')
@@ -947,10 +1077,10 @@ class NaviSonicPlayMusicByGenre(AbstractRequestHandler):
 
             # Work around the Amazon / Alexa 8 second timeout.
             controller.enqueue_songs(connection, play_queue, song_id_list[:2])  # When generating the playlist return the first two tracks.
-            backgroundProcess = Process(target=queue_worker_thread, args=(connection, play_queue, song_id_list[2:]))  # Create a thread to enqueue the remaining tracks
-            backgroundProcess.start()  # Start the additional thread
+            background_processes[device_id] = Process(target=queue_worker_thread, args=(connection, play_queue, song_id_list[2:]))  # Create a thread to enqueue the remaining tracks
+            background_processes[device_id].start()  # Start the additional thread
 
-            current_queue_description = f'{genre.value} music'
+            queue_descriptions[device_id] = f'{genre.value} music'
             speech = sanitise_speech_output(f'Playing {genre.value} music')
             logger.info(speech)
             card = {'title': 'AskNavidrome',
@@ -971,14 +1101,17 @@ class NaviSonicPlayMusicRandom(AbstractRequestHandler):
         return is_intent_name('NaviSonicPlayMusicRandom')(handler_input)
 
     def handle(self, handler_input: HandlerInput) -> Response:
-        global backgroundProcess, current_queue_description
         logger.debug('In NaviSonicPlayMusicRandom')
 
-        # Check if a background process is already running, if it is then terminate the process
-        # in favour of the new process.
-        if backgroundProcess is not None:
-            backgroundProcess.terminate()
-            backgroundProcess.join()
+        device_id = get_device_id(handler_input)
+        play_queue = get_play_queue(handler_input)
+
+        # Check if a background process is already running for this device, if
+        # it is then terminate the process in favour of the new process.
+        existing_process = background_processes.get(device_id)
+        if existing_process is not None:
+            existing_process.terminate()
+            existing_process.join()
 
         song_id_list = connection.build_random_song_list(min_song_count)
 
@@ -994,10 +1127,10 @@ class NaviSonicPlayMusicRandom(AbstractRequestHandler):
 
             # Work around the Amazon / Alexa 8 second timeout.
             controller.enqueue_songs(connection, play_queue, song_id_list[:2])  # When generating the playlist return the first two tracks.
-            backgroundProcess = Process(target=queue_worker_thread, args=(connection, play_queue, song_id_list[2:]))  # Create a thread to enqueue the remaining tracks
-            backgroundProcess.start()  # Start the additional thread
+            background_processes[device_id] = Process(target=queue_worker_thread, args=(connection, play_queue, song_id_list[2:]))  # Create a thread to enqueue the remaining tracks
+            background_processes[device_id].start()  # Start the additional thread
 
-            current_queue_description = 'random music'
+            queue_descriptions[device_id] = 'random music'
             speech = sanitise_speech_output('Playing random music')
             logger.info(speech)
             card = {'title': 'AskNavidrome',
@@ -1018,14 +1151,17 @@ class NaviSonicPlayFavouriteSongs(AbstractRequestHandler):
         return is_intent_name('NaviSonicPlayFavouriteSongs')(handler_input)
 
     def handle(self, handler_input: HandlerInput) -> Response:
-        global backgroundProcess, current_queue_description
         logger.debug('In NaviSonicPlayFavouriteSongs')
 
-        # Check if a background process is already running, if it is then terminate the process
-        # in favour of the new process.
-        if backgroundProcess is not None:
-            backgroundProcess.terminate()
-            backgroundProcess.join()
+        device_id = get_device_id(handler_input)
+        play_queue = get_play_queue(handler_input)
+
+        # Check if a background process is already running for this device, if
+        # it is then terminate the process in favour of the new process.
+        existing_process = background_processes.get(device_id)
+        if existing_process is not None:
+            existing_process.terminate()
+            existing_process.join()
 
         song_id_list = connection.build_song_list_from_favourites()
 
@@ -1041,10 +1177,10 @@ class NaviSonicPlayFavouriteSongs(AbstractRequestHandler):
 
             # Work around the Amazon / Alexa 8 second timeout.
             controller.enqueue_songs(connection, play_queue, song_id_list[:2])  # When generating the playlist return the first two tracks.
-            backgroundProcess = Process(target=queue_worker_thread, args=(connection, play_queue, song_id_list[2:]))  # Create a thread to enqueue the remaining tracks
-            backgroundProcess.start()  # Start the additional thread
+            background_processes[device_id] = Process(target=queue_worker_thread, args=(connection, play_queue, song_id_list[2:]))  # Create a thread to enqueue the remaining tracks
+            background_processes[device_id].start()  # Start the additional thread
 
-            current_queue_description = 'your favourite tracks'
+            queue_descriptions[device_id] = 'your favourite tracks'
             speech = sanitise_speech_output('Playing your favourite tracks.')
             logger.info(speech)
             card = {'title': 'AskNavidrome',
@@ -1067,6 +1203,7 @@ class NaviSonicRandomiseQueue(AbstractRequestHandler):
     def handle(self, handler_input: HandlerInput) -> Response:
         logger.debug('In NaviSonicRandomiseQueue Handler')
 
+        play_queue = get_play_queue(handler_input)
         play_queue.shuffle()
         play_queue.sync()
 
@@ -1085,6 +1222,7 @@ class NaviSonicSongDetails(AbstractRequestHandler):
     def handle(self, handler_input: HandlerInput) -> Response:
         logger.debug('In NaviSonicSongDetails Handler')
 
+        play_queue = get_play_queue(handler_input)
         current_track = play_queue.get_current_track()
 
         title = sanitise_speech_output(current_track.title)
@@ -1109,6 +1247,7 @@ class NaviSonicStarSong(AbstractRequestHandler):
     def handle(self, handler_input: HandlerInput) -> Response:
         logger.debug('In NaviSonicStarSong Handler')
 
+        play_queue = get_play_queue(handler_input)
         current_track = play_queue.get_current_track()
 
         song_id = current_track.id
@@ -1129,6 +1268,7 @@ class NaviSonicUnstarSong(AbstractRequestHandler):
     def handle(self, handler_input: HandlerInput) -> Response:
         logger.debug('In NaviSonicUnstarSong Handler')
 
+        play_queue = get_play_queue(handler_input)
         current_track = play_queue.get_current_track()
 
         song_id = current_track.id
@@ -1172,6 +1312,8 @@ class PlaybackStoppedHandler(AbstractRequestHandler):
     def handle(self, handler_input: HandlerInput) -> Response:
         logger.debug('In PlaybackStoppedHandler')
 
+        play_queue = get_play_queue(handler_input)
+
         # store the current offset for later resumption
         play_queue.set_current_track_offset(handler_input.request_envelope.request.offset_in_milliseconds)
 
@@ -1194,6 +1336,7 @@ class PlaybackNearlyFinishedHandler(AbstractRequestHandler):
     def handle(self, handler_input: HandlerInput) -> Response:
         logger.debug('In PlaybackNearlyFinishedHandler')
         logger.info('Queuing next track...')
+        play_queue = get_play_queue(handler_input)
         track_details = play_queue.enqueue_next_track()
 
         if track_details is None:
@@ -1218,6 +1361,8 @@ class PlaybackFinishedHandler(AbstractRequestHandler):
     def handle(self, handler_input: HandlerInput) -> Response:
         logger.debug('In PlaybackFinishedHandler')
 
+        play_queue = get_play_queue(handler_input)
+
         # Generate a timestamp in milliseconds for scrobbling
         timestamp_ms = datetime.now().timestamp()
         current_track = play_queue.get_current_track()
@@ -1240,6 +1385,7 @@ class PausePlaybackHandler(AbstractRequestHandler):
 
     def handle(self, handler_input: HandlerInput) -> Response:
         logger.debug('In PausePlaybackHandler')
+        play_queue = get_play_queue(handler_input)
         play_queue.sync()
 
         return controller.stop(handler_input)
@@ -1258,10 +1404,13 @@ class ResumePlaybackHandler(AbstractRequestHandler):
     def handle(self, handler_input: HandlerInput) -> Response:
         logger.debug('In ResumePlaybackHandler')
 
+        device_id = get_device_id(handler_input)
+        play_queue = get_play_queue(handler_input)
         current_track = play_queue.get_current_track()
+        description = queue_descriptions.get(device_id)
 
-        if current_queue_description:
-            text = sanitise_speech_output(f'Now playing {current_queue_description}')
+        if description:
+            text = sanitise_speech_output(f'Now playing {description}')
         else:
             text = None
 
@@ -1298,6 +1447,7 @@ class NextPlaybackHandler(AbstractRequestHandler):
     def handle(self, handler_input: HandlerInput) -> Response:
         logger.debug('In NextPlaybackHandler')
 
+        play_queue = get_play_queue(handler_input)
         track_details = play_queue.get_next_track()
 
         # Set the offset to 0 as we are skipping we want to start at the beginning
@@ -1315,6 +1465,7 @@ class PreviousPlaybackHandler(AbstractRequestHandler):
 
     def handle(self, handler_input: HandlerInput) -> Response:
         logger.debug('In PreviousPlaybackHandler')
+        play_queue = get_play_queue(handler_input)
         track_details = play_queue.get_previous_track()
 
         # Set the offset to 0 as we are skipping we want to start at the beginning
@@ -1335,6 +1486,7 @@ class PlaybackFailedEventHandler(AbstractRequestHandler):
     def handle(self, handler_input: HandlerInput) -> Response:
         logger.debug('In PlaybackFailedHandler')
 
+        play_queue = get_play_queue(handler_input)
         current_track = play_queue.get_current_track()
         song_id = current_track.id
 
@@ -1496,6 +1648,7 @@ sb.add_request_handler(LaunchRequestHandler())
 sb.add_request_handler(CheckAudioInterfaceHandler())
 sb.add_request_handler(SkillEventHandler())
 sb.add_request_handler(HelpHandler())
+sb.add_request_handler(NaviSonicHelpTopic())
 sb.add_request_handler(NaviSonicPlayMusicByArtist())
 sb.add_request_handler(NaviSonicPlayAlbumByArtist())
 sb.add_request_handler(NaviSonicPlaySongByArtist())
@@ -1540,41 +1693,77 @@ if navidrome_log_level == 3:
     logger.warning('AskNavidrome debugging has been enabled, this should only be used when testing!')
     logger.warning('The /buffer, /queue and /history http endpoints are available publicly!')
 
+    def resolve_debug_queue():
+        """Resolve which device's MediaQueue a debug request is for.
+
+        Playback state is now per-device, so these debug routes need to know
+        which device to show. Pass ?device=<id> to pick one; otherwise falls
+        back to the only active device, or the first if several are active.
+
+        :return: (device_id, MediaQueue) if a device is available, else (None, None)
+        :rtype: tuple
+        """
+        requested_device = request.args.get('device')
+
+        if requested_device:
+            return requested_device, play_queues.get(requested_device)
+
+        if not play_queues:
+            return None, None
+
+        device_id = next(iter(play_queues))
+        return device_id, play_queues[device_id]
+
     @app.route('/queue')
     def view_queue():
-        """View the contents of play_queue.queue
+        """View the contents of a device's play_queue.queue
 
         Creates a tabulated page containing the contents of the play_queue.queue deque.
         """
 
-        current_track = play_queue.get_current_track()
+        device_id, device_queue = resolve_debug_queue()
 
-        return render_template('table.html', title='AskNavidrome - Queued Tracks',
-                               tracks=play_queue.get_current_queue(), current=current_track)
+        if device_queue is None:
+            return f'No active playback queue for device {device_id!r}. Active devices: {list(play_queues)}'
+
+        current_track = device_queue.get_current_track()
+
+        return render_template('table.html', title=f'AskNavidrome - Queued Tracks ({device_id})',
+                               tracks=device_queue.get_current_queue(), current=current_track)
 
     @app.route('/history')
     def view_history():
-        """View the contents of play_queue.history
+        """View the contents of a device's play_queue.history
 
         Creates a tabulated page containing the contents of the play_queue.history deque.
         """
 
-        current_track = play_queue.get_current_track()
+        device_id, device_queue = resolve_debug_queue()
 
-        return render_template('table.html', title='AskNavidrome - Track History',
-                               tracks=play_queue.get_history(), current=current_track)
+        if device_queue is None:
+            return f'No active playback queue for device {device_id!r}. Active devices: {list(play_queues)}'
+
+        current_track = device_queue.get_current_track()
+
+        return render_template('table.html', title=f'AskNavidrome - Track History ({device_id})',
+                               tracks=device_queue.get_history(), current=current_track)
 
     @app.route('/buffer')
     def view_buffer():
-        """View the contents of play_queue.buffer
+        """View the contents of a device's play_queue.buffer
 
         Creates a tabulated page containing the contents of the play_queue.buffer deque.
         """
 
-        current_track = play_queue.get_current_track()
+        device_id, device_queue = resolve_debug_queue()
 
-        return render_template('table.html', title='AskNavidrome - Buffered Tracks',
-                               tracks=play_queue.get_buffer(), current=current_track)
+        if device_queue is None:
+            return f'No active playback queue for device {device_id!r}. Active devices: {list(play_queues)}'
+
+        current_track = device_queue.get_current_track()
+
+        return render_template('table.html', title=f'AskNavidrome - Buffered Tracks ({device_id})',
+                               tracks=device_queue.get_buffer(), current=current_track)
 
 
 # Run web app by default when file is executed.
