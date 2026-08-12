@@ -27,5 +27,8 @@ config, and deploying the Alexa skill. The changes below aren't reflected there 
 - **Real cover art** sent in `AudioPlayer` metadata instead of a static icon.
 - **Per-device playback state**, so multiple Echo devices don't clobber each other's queue/position.
 - Invocation name changed to "my music".
+- **Unverified requests get a 404**, not a 405/400. The skill endpoint only accepts POST requests that pass
+  Alexa's signature/timestamp verification; anything else (a browser GET, a probe with no/bad signature) now
+  looks like the route doesn't exist instead of confirming a live endpoint.
 - `Dockerfile` builds from the checked-out source (`COPY .`) instead of the upstream Dockerfile's `git clone` of
   itself mid-build, so a local build actually picks up these changes.
