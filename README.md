@@ -29,6 +29,3 @@ config, and deploying the Alexa skill. The changes below aren't reflected there 
 - Invocation name changed to "my music".
 - `Dockerfile` builds from the checked-out source (`COPY .`) instead of the upstream Dockerfile's `git clone` of
   itself mid-build, so a local build actually picks up these changes.
-
-Deployed via git submodule from the [mediacenter](https://github.com/mpdeglau/mediacenter) compose repo
-(`compose/mc/asknavidrome`, built by `compose/mc/navidrome.yml`). See that repo for the upstream-sync workflow.
