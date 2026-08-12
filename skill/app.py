@@ -8,6 +8,8 @@ import os
 import random
 import sys
 
+from werkzeug.exceptions import BadRequest, MethodNotAllowed, NotFound
+
 from ask_sdk_core.skill_builder import SkillBuilder
 from ask_sdk_core.dispatch_components import AbstractRequestHandler, AbstractRequestInterceptor, AbstractResponseInterceptor
 from ask_sdk_core.utils import is_request_type, is_intent_name, get_slot_value_v2, get_intent_name, get_request_type
@@ -1687,6 +1689,29 @@ if navidrome_log_level >= 2:
 
 sa = SkillAdapter(skill=sb.create(), skill_id='test', app=app)
 sa.register(app=app, route='/')
+
+
+@app.errorhandler(MethodNotAllowed)
+def hide_endpoint_on_bad_method(_error):
+    """Return 404 instead of 405 for non-POST requests.
+
+    The skill endpoint only accepts POST from Alexa. A 405 confirms to
+    anyone probing the URL (e.g. a browser GET) that something is
+    listening here; a 404 makes it look like nothing exists.
+    """
+    return NotFound()
+
+
+@app.errorhandler(BadRequest)
+def hide_endpoint_on_failed_verification(_error):
+    """Return 404 instead of 400 when Alexa request verification fails.
+
+    SkillAdapter raises BadRequest when the request signature/timestamp
+    can't be verified, i.e. it didn't genuinely come from Alexa. Same
+    reasoning as above: don't confirm a live endpoint to unverified
+    requests.
+    """
+    return NotFound()
 
 # Enable queue and history diagnostics
 if navidrome_log_level == 3:
