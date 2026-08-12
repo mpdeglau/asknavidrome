@@ -1,7 +1,7 @@
 {
     "interactionModel": {
         "languageModel": {
-            "invocationName": "navisonic",
+            "invocationName": "my music",
             "intents": [
                 {
                     "name": "AMAZON.CancelIntent",
@@ -66,7 +66,8 @@
                     ],
                     "samples": [
                         "Play the album {album}",
-                        "Play the album {album} by {artist}"
+                        "Play the album {album} by {artist}",
+                        "Play {album} by {artist}"
                     ]
                 },
                 {
@@ -74,12 +75,15 @@
                     "slots": [
                         {
                             "name": "playlist",
-                            "type": "playlist_names"
+                            "type": "AMAZON.SearchQuery"
                         }
                     ],
                     "samples": [
-                        "Play the {playlist} playlist",
-                        "Start the {playlist} playlist"
+                        "Play the playlist {playlist}",
+                        "Start the playlist {playlist}",
+                        "Play playlist {playlist}",
+                        "Play my playlist {playlist}",
+                        "Play my {playlist}"
                     ]
                 },
                 {
@@ -139,7 +143,8 @@
                         "Play the song {song} by the band {artist}",
                         "Play {song} by the band {artist}",
                         "Play {song} by {artist}",
-                        "Play the song {song} by the artist {artist}"
+                        "Play the song {song} by the artist {artist}",
+                        "Play the song {song}"
                     ]
                 },
                 {
@@ -186,25 +191,96 @@
                         "shuffle",
                         "shuffle the queue"
                     ]
+                },
+                {
+                    "name": "NaviSonicListPlaylists",
+                    "slots": [],
+                    "samples": [
+                        "what playlists do I have",
+                        "what playlists are available",
+                        "list my playlists",
+                        "list the playlists",
+                        "what playlists can I play"
+                    ]
+                },
+                {
+                    "name": "NaviSonicFindPlaylist",
+                    "slots": [
+                        {
+                            "name": "query",
+                            "type": "AMAZON.SearchQuery"
+                        }
+                    ],
+                    "samples": [
+                        "find me a playlist about {query}",
+                        "find a playlist about {query}",
+                        "suggest a playlist for {query}",
+                        "what playlist matches {query}",
+                        "recommend a playlist for {query}"
+                    ]
+                },
+                {
+                    "name": "NaviSonicHearMorePlaylists",
+                    "slots": [],
+                    "samples": [
+                        "hear more",
+                        "hear some more",
+                        "more playlists",
+                        "tell me more playlists",
+                        "read more playlists"
+                    ]
+                },
+                {
+                    "name": "NaviSonicHelpTopic",
+                    "slots": [
+                        {
+                            "name": "topic",
+                            "type": "help_topic"
+                        }
+                    ],
+                    "samples": [
+                        "help with {topic}",
+                        "tell me about {topic}",
+                        "I need help with {topic}",
+                        "{topic}"
+                    ]
                 }
             ],
             "types": [
                 {
-                    "name": "playlist_names",
+                    "name": "help_topic",
                     "values": [
                         {
                             "name": {
-                                "value": "Background Music"
+                                "value": "playing music",
+                                "synonyms": [
+                                    "play music",
+                                    "playing",
+                                    "music",
+                                    "how to play music"
+                                ]
                             }
                         },
                         {
                             "name": {
-                                "value": "Rock Songs"
+                                "value": "finding playlists",
+                                "synonyms": [
+                                    "playlists",
+                                    "find a playlist",
+                                    "finding a playlist",
+                                    "playlist help"
+                                ]
                             }
                         },
                         {
                             "name": {
-                                "value": "Work Music"
+                                "value": "playback controls",
+                                "synonyms": [
+                                    "controls",
+                                    "playback",
+                                    "controlling playback",
+                                    "control playback"
+                                ]
                             }
                         }
                     ]
