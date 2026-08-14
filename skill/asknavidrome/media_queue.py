@@ -288,3 +288,31 @@ class MediaQueue:
         """
 
         self.buffer = deepcopy(self.queue)
+
+    def dump(self) -> dict:
+        """Export a snapshot of the full queue state (queue, history, buffer
+        and current track/offset), so playback of another source can take
+        over the underlying MediaQueue without losing this position.
+
+        :return: A dict suitable for passing back into restore()
+        :rtype: dict
+        """
+
+        return {
+            'queue': deepcopy(self.queue),
+            'history': deepcopy(self.history),
+            'buffer': deepcopy(self.buffer),
+            'current_track': deepcopy(self.current_track),
+        }
+
+    def restore(self, snapshot: dict) -> None:
+        """Replace this queue's state with one previously captured by dump().
+
+        :param dict snapshot: A dict as returned by dump()
+        :return: None
+        """
+
+        self.queue = deepcopy(snapshot['queue'])
+        self.history = deepcopy(snapshot['history'])
+        self.buffer = deepcopy(snapshot['buffer'])
+        self.current_track = deepcopy(snapshot['current_track'])

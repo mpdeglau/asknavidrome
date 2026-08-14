@@ -212,6 +212,22 @@ background_processes = {}
 # spoken back on resume so the user knows what's about to play.
 queue_descriptions = {}
 
+# device_id -> playlist_id of the playlist currently loaded into that
+# device's queue, if any (None/absent when the queue holds something else,
+# e.g. an album). Lets play_playlist_by_id() tell whether it's safe to
+# snapshot the outgoing queue as "playlist X's saved position" before
+# clearing it for a new one - see saved_playlist_queues below.
+current_playlist_id = {}
+
+# device_id -> {playlist_id: MediaQueue.dump() snapshot}. Populated when a
+# device switches away from one playlist to another, so asking to play the
+# first one again resumes where it was left off instead of restarting at
+# track 1. Only covers playlist-to-playlist switches: switching to an
+# album/artist/etc. and back to the same playlist still restarts it, since
+# those handlers clear current_playlist_id (via start_new_queue()) rather
+# than saving a snapshot.
+saved_playlist_queues = {}
+
 logger.debug('MediaQueue manager ready...')
 
 
@@ -240,6 +256,25 @@ def get_play_queue(handler_input: HandlerInput):
         play_queues[device_id] = manager.MediaQueue()
 
     return play_queues[device_id]
+
+
+def start_new_queue(device_id: str, play_queue) -> None:
+    """Clear a device's queue to start a fresh, non-playlist source
+    (album, artist, genre, song, random, favourites).
+
+    Also drops any 'currently active playlist' bookkeeping for this device.
+    Without this, if a playlist was playing before this new source started,
+    a later "play playlist X" could mistake this fresh (non-playlist) queue
+    for playlist X still being loaded, and snapshot the wrong tracks under
+    X's saved-queue slot in saved_playlist_queues.
+
+    :param str device_id: The requesting Alexa device's unique ID
+    :param play_queue: The device's MediaQueue
+    :return: None
+    """
+
+    play_queue.clear()
+    current_playlist_id.pop(device_id, None)
 
 # Connect to Navidrome
 connection = api.SubsonicConnection(navidrome_url,
@@ -457,7 +492,7 @@ class NaviSonicPlayMusicByArtist(AbstractRequestHandler):
 
             # Build a list of songs to play
             song_id_list = connection.build_song_list_from_albums(artist_album_lookup, min_song_count)
-            play_queue.clear()
+            start_new_queue(device_id, play_queue)
 
             controller.enqueue_songs(connection, play_queue, song_id_list[:2])  # When generating the playlist return the first two tracks.
             background_processes[device_id] = Process(target=queue_worker_thread, args=(connection, play_queue, song_id_list[2:]))  # Create a thread to enqueue the remaining tracks
@@ -530,7 +565,7 @@ class NaviSonicPlayAlbumByArtist(AbstractRequestHandler):
 
                 # At this point we have found an album that matches
                 song_id_list = connection.build_song_list_from_albums(result, -1)
-                play_queue.clear()
+                start_new_queue(device_id, play_queue)
 
                 # Work around the Amazon / Alexa 8 second timeout.
                 controller.enqueue_songs(connection, play_queue, song_id_list[:2])  # When generating the playlist return the first two tracks.
@@ -573,7 +608,7 @@ class NaviSonicPlayAlbumByArtist(AbstractRequestHandler):
                 return handler_input.response_builder.response
 
             else:
-                play_queue.clear()
+                start_new_queue(device_id, play_queue)
 
                 # Work around the Amazon / Alexa 8 second timeout.
                 controller.enqueue_songs(connection, play_queue, song_id_list[:2])  # When generating the playlist return the first two tracks.
@@ -654,7 +689,7 @@ class NaviSonicPlaySongByArtist(AbstractRequestHandler):
 
                 return handler_input.response_builder.response
 
-            play_queue.clear()
+            start_new_queue(device_id, play_queue)
             controller.enqueue_songs(connection, play_queue, song_dets)
 
             queue_descriptions[device_id] = f'{song.value} by {artist.value}'
@@ -687,7 +722,7 @@ def find_and_play_song(term: str, handler_input: HandlerInput) -> Union[Response
 
     song_dets = [item.get('id') for item in song_list]
 
-    play_queue.clear()
+    start_new_queue(device_id, play_queue)
     controller.enqueue_songs(connection, play_queue, song_dets)
 
     queue_descriptions[device_id] = str(term)
@@ -721,7 +756,7 @@ def find_and_play_album(term: str, handler_input: HandlerInput) -> Union[Respons
         # isn't a usable result either.
         return None
 
-    play_queue.clear()
+    start_new_queue(device_id, play_queue)
 
     # Work around the Amazon / Alexa 8 second timeout.
     controller.enqueue_songs(connection, play_queue, song_id_list[:2])  # When generating the playlist return the first two tracks.
@@ -805,6 +840,34 @@ def play_playlist_by_id(playlist_id: str, playlist_name: str, handler_input: Han
     device_id = get_device_id(handler_input)
     play_queue = get_play_queue(handler_input)
 
+    # Snapshot whatever playlist is currently loaded (if it's a different
+    # one than requested) before it's replaced or overwritten below, so it
+    # can be resumed later too - covers switching between more than two
+    # playlists, not just A/B.
+    previous_playlist_id = current_playlist_id.get(device_id)
+    if previous_playlist_id is not None and previous_playlist_id != playlist_id:
+        saved_playlist_queues.setdefault(device_id, {})[previous_playlist_id] = play_queue.dump()
+
+    device_saved_queues = saved_playlist_queues.get(device_id, {})
+    snapshot = device_saved_queues.pop(playlist_id, None)
+
+    if snapshot is not None:
+        # This device was previously part-way through this same playlist
+        # (before switching to a different one) - restore that position
+        # instead of rebuilding the queue and starting over at track 1.
+        play_queue.restore(snapshot)
+
+        current_playlist_id[device_id] = playlist_id
+        queue_descriptions[device_id] = 'the playlist ' + str(playlist_name)
+        speech = sanitise_speech_output('Resuming playlist ' + str(playlist_name))
+        logger.info(speech)
+        card = {'title': 'AskNavidrome',
+                'text': speech
+                }
+        track_details = play_queue.get_current_track()
+
+        return controller.start_playback('play', speech, card, track_details, handler_input)
+
     song_id_list = connection.build_song_list_from_playlist(playlist_id)
 
     if not song_id_list:
@@ -820,6 +883,7 @@ def play_playlist_by_id(playlist_id: str, playlist_name: str, handler_input: Han
     background_processes[device_id] = Process(target=queue_worker_thread, args=(connection, play_queue, song_id_list[2:]))  # Create a thread to enqueue the remaining tracks
     background_processes[device_id].start()  # Start the additional thread
 
+    current_playlist_id[device_id] = playlist_id
     queue_descriptions[device_id] = 'the playlist ' + str(playlist_name)
     speech = sanitise_speech_output('Playing playlist ' + str(playlist_name))
     logger.info(speech)
@@ -1075,7 +1139,7 @@ class NaviSonicPlayMusicByGenre(AbstractRequestHandler):
 
         else:
             random.shuffle(song_id_list)
-            play_queue.clear()
+            start_new_queue(device_id, play_queue)
 
             # Work around the Amazon / Alexa 8 second timeout.
             controller.enqueue_songs(connection, play_queue, song_id_list[:2])  # When generating the playlist return the first two tracks.
@@ -1125,7 +1189,7 @@ class NaviSonicPlayMusicRandom(AbstractRequestHandler):
 
         else:
             random.shuffle(song_id_list)
-            play_queue.clear()
+            start_new_queue(device_id, play_queue)
 
             # Work around the Amazon / Alexa 8 second timeout.
             controller.enqueue_songs(connection, play_queue, song_id_list[:2])  # When generating the playlist return the first two tracks.
@@ -1175,7 +1239,7 @@ class NaviSonicPlayFavouriteSongs(AbstractRequestHandler):
 
         else:
             random.shuffle(song_id_list)
-            play_queue.clear()
+            start_new_queue(device_id, play_queue)
 
             # Work around the Amazon / Alexa 8 second timeout.
             controller.enqueue_songs(connection, play_queue, song_id_list[:2])  # When generating the playlist return the first two tracks.

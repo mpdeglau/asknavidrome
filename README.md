@@ -26,6 +26,11 @@ config, and deploying the Alexa skill. The changes below aren't reflected there 
   on the fly are playable without editing the interaction model each time.
 - **Real cover art** sent in `AudioPlayer` metadata instead of a static icon.
 - **Per-device playback state**, so multiple Echo devices don't clobber each other's queue/position.
+- **Resuming a playlist picks up where you left off.** Switching from one playlist to another used to always
+  restart the new one at track 1 and discard the old one's position for good. Now, asking to play a playlist
+  you'd previously switched away from resumes it mid-track where you left it, instead of starting over — works
+  across any number of playlists switched between, not just A/B. Only covers playlist-to-playlist switches:
+  switching to an album/artist/etc. and back to the same playlist still restarts it.
 - Invocation name changed to "my music".
 - **Unverified requests get a 404**, not a 405/400. The skill endpoint only accepts POST requests that pass
   Alexa's signature/timestamp verification; anything else (a browser GET, a probe with no/bad signature) now
