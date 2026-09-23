@@ -1,6 +1,7 @@
 from datetime import datetime
 from flask import Flask, render_template, request
 from typing import Union
+import hmac
 import logging
 from multiprocessing import Process
 from multiprocessing.managers import BaseManager
@@ -1362,6 +1363,14 @@ class PlaybackStartedHandler(AbstractRequestHandler):
         logger.debug('In PlaybackStartedHandler')
         logger.info('Playback started')
 
+        # Report the track to Navidrome's now-playing list. The token is the
+        # Navidrome track ID (see controller.start_playback). Never let this
+        # break playback.
+        try:
+            connection.now_playing(handler_input.request_envelope.request.token)
+        except Exception as e:
+            logger.warning(f'Failed to report now playing to Navidrome: {e}')
+
         return handler_input.response_builder.response
 
 
@@ -1776,6 +1785,54 @@ def hide_endpoint_on_failed_verification(_error):
     requests.
     """
     return NotFound()
+
+def track_summary(track) -> dict:
+    """Minimal JSON-friendly view of a Track for the /status endpoint."""
+
+    return {'id': track.id, 'title': track.title, 'artist': track.artist,
+            'album': track.album, 'duration': track.duration}
+
+
+@app.route('/status')
+def playback_status():
+    """Per-device playback status for Home Assistant.
+
+    Returns what each device is playing from (queue description, e.g. 'the
+    playlist Crossover'), its current track and the next few queued tracks.
+    Only served when NAVI_STATUS_TOKEN is set and the request carries it as a
+    Bearer token; otherwise 404, same as the skill endpoint's hiding of itself
+    from unverified requests (this app is publicly routed via Traefik).
+    """
+
+    expected = os.getenv('NAVI_STATUS_TOKEN', '')
+    supplied = request.headers.get('Authorization', '').removeprefix('Bearer ')
+
+    if not expected or not hmac.compare_digest(supplied, expected):
+        return NotFound()
+
+    try:
+        upcoming_count = min(int(request.args.get('upcoming', 5)), 25)
+    except ValueError:
+        upcoming_count = 5
+
+    devices = []
+    for device_id, device_queue in list(play_queues.items()):
+        current = device_queue.get_current_track()
+        if not current.id:
+            continue
+
+        upcoming = list(device_queue.get_current_queue())[:upcoming_count]
+        devices.append({
+            'device_id': device_id,
+            'source': queue_descriptions.get(device_id),
+            'playlist_id': current_playlist_id.get(device_id),
+            'current': track_summary(current),
+            'upcoming': [track_summary(t) for t in upcoming],
+            'queue_length': device_queue.get_queue_count(),
+        })
+
+    return {'devices': devices}
+
 
 # Enable queue and history diagnostics
 if navidrome_log_level == 3:

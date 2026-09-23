@@ -101,6 +101,21 @@ class SubsonicConnection:
 
         return None
 
+    def now_playing(self, track_id: str) -> None:
+        """Tell Navidrome the given track is now playing
+
+        Sends a non-submission scrobble, which is what populates Navidrome's
+        getNowPlaying list (no play count is recorded).
+
+        :param str track_id: The ID of the track that started playing
+        :return: None
+        """
+        self.logger.debug('In function now_playing()')
+
+        self.conn.scrobble(track_id, False)
+
+        return None
+
     @staticmethod
     def _normalize_playlist_name(name: str) -> str:
         """Lowercase and strip everything but letters/digits, so voice-friendly
