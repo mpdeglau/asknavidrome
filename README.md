@@ -35,5 +35,15 @@ config, and deploying the Alexa skill. The changes below aren't reflected there 
 - **Unverified requests get a 404**, not a 405/400. The skill endpoint only accepts POST requests that pass
   Alexa's signature/timestamp verification; anything else (a browser GET, a probe with no/bad signature) now
   looks like the route doesn't exist instead of confirming a live endpoint.
+- **Reports "now playing" to Navidrome.** Upstream only scrobbles a track once it finishes, so Echo playback
+  never appeared in Navidrome's now-playing list (`getNowPlaying`). When Alexa starts a track, the skill now sends a
+  non-submission scrobble for it (no play count is recorded), so AskNavidrome sessions show up in Navidrome and
+  anything built on its now-playing data.
+- **`/status` endpoint** for dashboards (e.g. Home Assistant). `GET /status` returns, per Echo device, what the
+  queue is playing from (e.g. "the playlist Crossover", "the album X by Y"), the current track, the next few
+  queued tracks (`?upcoming=N`, default 5, max 25) and the queue length. It's disabled unless `NAVI_STATUS_TOKEN`
+  is set, and requests must send `Authorization: Bearer <token>`; anything else gets a 404, like the skill
+  endpoint. Since the skill URL is usually publicly routed, read this from the internal network rather than the
+  public hostname. Queues are held in memory, so the list is empty after a restart until the next voice request.
 - `Dockerfile` builds from the checked-out source (`COPY .`) instead of the upstream Dockerfile's `git clone` of
   itself mid-build, so a local build actually picks up these changes.
