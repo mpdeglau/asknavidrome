@@ -1367,7 +1367,8 @@ class PlaybackStartedHandler(AbstractRequestHandler):
         # Navidrome track ID (see controller.start_playback). Never let this
         # break playback.
         try:
-            connection.now_playing(handler_input.request_envelope.request.token)
+            connection.now_playing(handler_input.request_envelope.request.token,
+                                   get_device_id(handler_input))
         except Exception as e:
             logger.warning(f'Failed to report now playing to Navidrome: {e}')
 

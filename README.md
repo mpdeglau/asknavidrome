@@ -38,7 +38,10 @@ config, and deploying the Alexa skill. The changes below aren't reflected there 
 - **Reports "now playing" to Navidrome.** Upstream only scrobbles a track once it finishes, so Echo playback
   never appeared in Navidrome's now-playing list (`getNowPlaying`). When Alexa starts a track, the skill now sends a
   non-submission scrobble for it (no play count is recorded), so AskNavidrome sessions show up in Navidrome and
-  anything built on its now-playing data.
+  anything built on its now-playing data. Navidrome keeps one now-playing entry per user + client name, so each Echo
+  reports as its own client, `AskNavidrome-<last 8 chars of its device ID>`, and several Echos on the same account
+  don't overwrite each other. Streaming itself still uses the plain `AskNavidrome` client name, so per-player
+  settings in Navidrome (e.g. transcoding) are unaffected.
 - **`/status` endpoint** for dashboards (e.g. Home Assistant). `GET /status` returns, per Echo device, what the
   queue is playing from (e.g. "the playlist Crossover", "the album X by Y"), the current track, the next few
   queued tracks (`?upcoming=N`, default 5, max 25) and the queue length. It's disabled unless `NAVI_STATUS_TOKEN`

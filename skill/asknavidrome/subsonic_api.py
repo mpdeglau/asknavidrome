@@ -101,18 +101,34 @@ class SubsonicConnection:
 
         return None
 
-    def now_playing(self, track_id: str) -> None:
+    def now_playing(self, track_id: str, device_id: str = '') -> None:
         """Tell Navidrome the given track is now playing
 
         Sends a non-submission scrobble, which is what populates Navidrome's
         getNowPlaying list (no play count is recorded).
 
+        Navidrome keeps one now-playing entry per user + client name, so with
+        every Echo using the same account and client, a second Echo would
+        overwrite the first. When device_id is given the scrobble is sent with
+        a per-device client name ("AskNavidrome-<last 8 chars of device ID>")
+        so each Echo gets its own entry. Only this call uses it; streaming
+        still identifies as the normal client name.
+
         :param str track_id: The ID of the track that started playing
+        :param str device_id: The Alexa device ID the track is playing on
         :return: None
         """
         self.logger.debug('In function now_playing()')
 
-        self.conn.scrobble(track_id, False)
+        query = {'id': track_id, 'submission': False}
+        if device_id:
+            query['c'] = f'AskNavidrome-{device_id[-8:]}'
+
+        # libsonic's scrobble() has no way to override the client name, but
+        # its request builder lets per-call query params override the base ones.
+        req = self.conn._getRequest('scrobble.view', self.conn._getQueryDict(query))
+        res = self.conn._doInfoReq(req)
+        self.conn._checkStatus(res)
 
         return None
 
