@@ -48,5 +48,24 @@ config, and deploying the Alexa skill. The changes below aren't reflected there 
   is set, and requests must send `Authorization: Bearer <token>`; anything else gets a 404, like the skill
   endpoint. Since the skill URL is usually publicly routed, read this from the internal network rather than the
   public hostname. Queues are held in memory, so the list is empty after a restart until the next voice request.
+- **Playlist groups.** Playlists named `{Group} - {Name}` (e.g. AudioMuse's `Rock - Easy Drive_automatic`, or
+  `Radio - Long Haul`) can be browsed and picked by group: "what rock playlists do I have" lists just that group
+  (`NaviSonicListPlaylistsInGroup`), and "play a blues playlist" plays a random one from it, avoiding whichever
+  playlist is already loaded (`NaviSonicPlayPlaylistInGroup`). Group names match loosely, so "R and B" finds `R&B`
+  and "hip hop" finds `Hip-Hop`.
+- **Cleaner spoken playlist names.** Everywhere a playlist name is spoken (listing, "did you mean", "playing
+  playlist", `/status`), the group prefix and `_automatic` suffix are dropped: `Rock - Easy Drive_automatic` is read
+  as "Easy Drive". When two playlists in the same answer would sound identical (e.g. `Rock - Quiet Evening
+  Reflection` and `Pop - Quiet Evening Reflection`), each is read with its group instead ("Rock Quiet Evening
+  Reflection"). Any of these forms can be said back to play it, and right after listing one group, the bare name
+  plays that group's playlist. Configurable with environment variables:
+
+  | Variable | Default | Meaning |
+  |---|---|---|
+  | `NAVI_PLAYLIST_NAME_PATTERN` | `^(?P<group>.+?) - (?P<name>.+?)(?:_automatic)?$` | Regex splitting a playlist name into named groups `group` and `name`. Names it doesn't match are spoken as-is and belong to no group. |
+  | `NAVI_PLAYLIST_SPOKEN_FORMAT` | `{name}` | How a grouped playlist is spoken. |
+  | `NAVI_PLAYLIST_QUALIFIED_FORMAT` | `{group} {name}` | How it's spoken when its spoken form would clash with another playlist's. |
+
+  In a Compose file, write `$` in the pattern as `$$`.
 - `Dockerfile` builds from the checked-out source (`COPY .`) instead of the upstream Dockerfile's `git clone` of
   itself mid-build, so a local build actually picks up these changes.

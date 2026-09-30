@@ -23,6 +23,7 @@ from flask_ask_sdk.skill_adapter import SkillAdapter
 import asknavidrome.subsonic_api as api
 import asknavidrome.media_queue as queue
 import asknavidrome.controller as controller
+import asknavidrome.playlist_names as playlist_naming
 
 
 def resolved_slot_value(slot):
@@ -159,6 +160,17 @@ try:
 except NameError as err:
     logger.error(f'The Navidrome API version was not found! {err}')
     raise
+
+# How grouped playlist names (e.g. "Rock - Easy Drive_automatic") are split
+# into a group and a name, and how they're spoken. See PlaylistNames.
+playlist_names = playlist_naming.PlaylistNames(
+    os.getenv('NAVI_PLAYLIST_NAME_PATTERN') or playlist_naming.DEFAULT_NAME_PATTERN,
+    os.getenv('NAVI_PLAYLIST_SPOKEN_FORMAT') or playlist_naming.DEFAULT_SPOKEN_FORMAT,
+    os.getenv('NAVI_PLAYLIST_QUALIFIED_FORMAT') or playlist_naming.DEFAULT_QUALIFIED_FORMAT,
+)
+logger.info(f'Playlist name pattern: {playlist_names.pattern.pattern}, '
+            f'spoken as: {playlist_names.spoken_format}, '
+            f'qualified as: {playlist_names.qualified_format}')
 
 logger.debug('Configuration has been successfully loaded')
 
@@ -367,7 +379,8 @@ HELP_TOPICS = {
     ),
     'finding playlists': (
         "You can say what playlists do I have, and I'll read some out — say hear some more "
-        'to keep going. Or say find me a playlist about a mood or genre, like upbeat or blues, '
+        'to keep going. Ask what rock playlists do I have to hear just one genre, or say play a '
+        "blues playlist and I'll pick one for you. Or say find me a playlist about a mood or genre, like upbeat or blues, "
         "and I'll find one for you. Once you know the name, say play the playlist, followed by the name."
     ),
     'playback controls': (
@@ -813,11 +826,13 @@ def speak_playlist_choices(candidate_names: list, handler_input: HandlerInput) -
     """Build a clarifying "did you mean X, Y, or Z?" response and keep the
     session open for the user's follow-up.
 
-    :param list candidate_names: 2+ playlist names to offer as choices
+    :param list candidate_names: 2+ stored playlist names to offer as choices
     :param HandlerInput handler_input: The Amazon Alexa HandlerInput object
     :return: An Alexa Response asking the user to pick one
     :rtype: Response
     """
+    candidate_names = playlist_names.spoken_list(candidate_names)
+
     if len(candidate_names) == 2:
         options = f'{candidate_names[0]}, or {candidate_names[1]}'
     else:
@@ -833,11 +848,12 @@ def play_playlist_by_id(playlist_id: str, playlist_name: str, handler_input: Han
     """Start playback of a known playlist by id.
 
     :param str playlist_id: The playlist's id
-    :param str playlist_name: The playlist's display name, used for speech/description
+    :param str playlist_name: The playlist's stored name; its spoken form is used for speech/description
     :param HandlerInput handler_input: The Amazon Alexa HandlerInput object
     :return: An Alexa Response
     :rtype: Response
     """
+    playlist_name = playlist_names.spoken(playlist_name)
     device_id = get_device_id(handler_input)
     play_queue = get_play_queue(handler_input)
 
@@ -917,12 +933,31 @@ def find_and_play_playlist(term: str, handler_input: HandlerInput) -> Union[Resp
     :return: An Alexa Response (playing a match, or asking to disambiguate) if anything close was found, else None
     :rtype: Response | None
     """
-    ranked = connection.rank_playlists(term)
+    ranked = connection.rank_playlists(term, name_forms=playlist_names.match_forms)
 
     if not ranked or ranked[0][0] < 0.6:
         return None
 
     top_score, top_id, top_name = ranked[0]
+
+    # Near-certain matches play straight away, unless the runner-up is
+    # near-certain too - e.g. "Quiet Evening Reflection" spoken with its
+    # genre prefix dropped exists as both "Rock - ..." and "Pop - ...".
+    runner_up_certain = len(ranked) > 1 and ranked[1][0] >= 0.97
+
+    if runner_up_certain:
+        certain = [entry for entry in ranked if entry[0] >= 0.97]
+
+        # Just listed one group's playlists (where these read without their
+        # prefix)? Then the one from that group is the one meant.
+        listed_group = handler_input.attributes_manager.session_attributes.get('playlist_group')
+        in_listed_group = [entry for entry in certain if listed_group and playlist_names.group_of(entry[2]) == listed_group]
+        if len(in_listed_group) == 1:
+            _, chosen_id, chosen_name = in_listed_group[0]
+
+            return play_playlist_by_id(chosen_id, chosen_name, handler_input)
+
+        return speak_playlist_choices([name for _, _, name in certain[:5]], handler_input)
 
     if top_score < 0.97 and len(ranked) > 1 and (top_score - ranked[1][0]) < 0.15:
         close_candidates = [name for score, _, name in ranked[1:3] if (top_score - score) < 0.15]
@@ -968,22 +1003,31 @@ class NaviSonicPlayPlaylist(AbstractRequestHandler):
         return handler_input.response_builder.response
 
 
-def speak_playlist_page(names: list, offset: int, handler_input: HandlerInput, page_size: int = 8) -> Response:
+def speak_playlist_page(names: list, offset: int, handler_input: HandlerInput, page_size: int = 8, group: str = '') -> Response:
     """Speak playlist names starting at `offset`, prompting the user to
     either play one or hear more, and remember position in session
     attributes so a follow-up "hear more" can continue from here.
 
-    :param list names: All playlist names, in the order to page through
+    :param list names: All playlist names, already in spoken form, in the order to page through
     :param int offset: Index of the first name to speak this turn
     :param HandlerInput handler_input: The Amazon Alexa HandlerInput object
     :param int page_size: How many names to speak per turn
+    :param str group: The playlist group being listed (e.g. "Rock"), if only one;
+        spoken in the intro and remembered so a follow-up "play X" prefers that group
     :return: An Alexa Response
     :rtype: Response
     """
+    label = spoken_group(group) if group else ''
     page = names[offset:offset + page_size]
     remaining = len(names) - (offset + len(page))
 
-    intro = f'You have {len(names)} playlists. Here are some: ' if offset == 0 else 'Here are some more: '
+    described = f'{label} playlist' if label else 'playlist'
+    if offset == 0:
+        intro = f'You have {len(names)} {described}{"" if len(names) == 1 else "s"}. '
+        if len(names) > 1:
+            intro += 'Here are some: ' if remaining > 0 else 'They are: '
+    else:
+        intro = 'Here are some more: '
 
     if remaining > 0:
         prompt = 'Do you want to play one of these, or hear some more?'
@@ -991,18 +1035,19 @@ def speak_playlist_page(names: list, offset: int, handler_input: HandlerInput, p
         handler_input.attributes_manager.session_attributes = {
             'playlist_names': names,
             'playlist_offset': offset + len(page),
+            'playlist_group': group,
         }
     else:
-        prompt = "That's all of them. Do you want to play one of these?"
+        prompt = 'Do you want to play it?' if len(names) == 1 else "That's all of them. Do you want to play one of these?"
 
         # Reached the end: nothing left to page through this session.
-        handler_input.attributes_manager.session_attributes = {}
+        handler_input.attributes_manager.session_attributes = {'playlist_group': group} if group else {}
 
     speech = sanitise_speech_output(intro + ', '.join(page) + '. ' + prompt)
     logger.info(speech)
 
     handler_input.response_builder.set_card(
-        StandardCard(title='AskNavidrome Playlists', text='\n'.join(names))
+        StandardCard(title=f'AskNavidrome {label} Playlists' if label else 'AskNavidrome Playlists', text='\n'.join(names))
     )
     handler_input.response_builder.speak(speech).ask(sanitise_speech_output(prompt))
 
@@ -1022,7 +1067,7 @@ class NaviSonicListPlaylists(AbstractRequestHandler):
     def handle(self, handler_input: HandlerInput) -> Response:
         logger.debug('In NaviSonicListPlaylists')
 
-        names = sorted(item.get('name') for item in connection.get_all_playlists())
+        names = playlist_names.spoken_list(sorted(item.get('name') for item in connection.get_all_playlists()))
 
         if not names:
             text = sanitise_speech_output("You don't have any playlists yet.")
@@ -1050,14 +1095,123 @@ class NaviSonicHearMorePlaylists(AbstractRequestHandler):
         session_attrs = handler_input.attributes_manager.session_attributes
         names = session_attrs.get('playlist_names')
         offset = session_attrs.get('playlist_offset', 0)
+        group = session_attrs.get('playlist_group', '')
 
         if not names:
             # No list in progress this session (e.g. "hear more" out of the
             # blue) - start one fresh rather than erroring.
-            names = sorted(item.get('name') for item in connection.get_all_playlists())
+            names = playlist_names.spoken_list(sorted(item.get('name') for item in connection.get_all_playlists()))
             offset = 0
+            group = ''
 
-        return speak_playlist_page(names, offset, handler_input)
+        return speak_playlist_page(names, offset, handler_input, group=group)
+
+
+def spoken_group(group: str) -> str:
+    """Make a playlist group name read naturally, e.g. "R&B" as "R and B"
+    rather than sanitise_speech_output's run-together "RandB".
+    """
+    return group.replace('&', ' and ')
+
+
+def playlists_in_group(requested_group: str) -> tuple:
+    """Find playlists whose name puts them in the requested group.
+
+    :param str requested_group: The group as spoken (e.g. "rock", "hip hop")
+    :return: (the group's name as stored, e.g. "Hip-Hop", or None if nothing
+        matched; that group's playlists; every group name seen)
+    :rtype: tuple
+    """
+    wanted = playlist_names.normalize_group(requested_group)
+    matched_group = None
+    matches = []
+    all_groups = set()
+
+    for item in connection.get_all_playlists():
+        group = playlist_names.group_of(item.get('name'))
+        if group is None:
+            continue
+
+        all_groups.add(group)
+        if wanted and playlist_names.normalize_group(group) == wanted:
+            matched_group = group
+            matches.append(item)
+
+    return matched_group, matches, sorted(all_groups)
+
+
+def speak_unknown_group(requested_group: str, all_groups: list, handler_input: HandlerInput) -> Response:
+    """Tell the user a playlist group has no playlists, and which groups do.
+    """
+    text = f"You don't have any {requested_group} playlists." if requested_group else 'Which kind of playlist?'
+    if all_groups:
+        text += ' You have playlists for ' + ', '.join(spoken_group(g) for g in all_groups) + '.'
+
+    text = sanitise_speech_output(text)
+    handler_input.response_builder.speak(text).ask(text)
+
+    return handler_input.response_builder.response
+
+
+class NaviSonicListPlaylistsInGroup(AbstractRequestHandler):
+    """Handle NaviSonicListPlaylistsInGroup
+
+    Read back the playlists in one group, e.g. "what rock playlists do I
+    have" lists every "Rock - ..." playlist.
+    """
+
+    def can_handle(self, handler_input: HandlerInput) -> bool:
+        return is_intent_name('NaviSonicListPlaylistsInGroup')(handler_input)
+
+    def handle(self, handler_input: HandlerInput) -> Response:
+        logger.debug('In NaviSonicListPlaylistsInGroup')
+
+        group_slot = get_slot_value_v2(handler_input, 'group')
+        requested_group = resolved_slot_value(group_slot) if group_slot else ''
+        group, matches, all_groups = playlists_in_group(requested_group)
+
+        if not matches:
+            return speak_unknown_group(requested_group, all_groups, handler_input)
+
+        names = playlist_names.spoken_list(sorted(item.get('name') for item in matches))
+
+        return speak_playlist_page(names, 0, handler_input, group=group)
+
+
+class NaviSonicPlayPlaylistInGroup(AbstractRequestHandler):
+    """Handle NaviSonicPlayPlaylistInGroup
+
+    Play a randomly chosen playlist from one group, e.g. "play a blues
+    playlist" picks one of the "Blues - ..." playlists.
+    """
+
+    def can_handle(self, handler_input: HandlerInput) -> bool:
+        return is_intent_name('NaviSonicPlayPlaylistInGroup')(handler_input)
+
+    def handle(self, handler_input: HandlerInput) -> Response:
+        logger.debug('In NaviSonicPlayPlaylistInGroup')
+
+        device_id = get_device_id(handler_input)
+
+        # Check if a background process is already running for this device, if
+        # it is then terminate the process in favour of the new process.
+        existing_process = background_processes.get(device_id)
+        if existing_process is not None:
+            existing_process.terminate()
+            existing_process.join()
+
+        group_slot = get_slot_value_v2(handler_input, 'group')
+        requested_group = resolved_slot_value(group_slot) if group_slot else ''
+        group, matches, all_groups = playlists_in_group(requested_group)
+
+        if not matches:
+            return speak_unknown_group(requested_group, all_groups, handler_input)
+
+        # Asking again for the same group should give something different.
+        candidates = [item for item in matches if item.get('id') != current_playlist_id.get(device_id)] or matches
+        choice = random.choice(candidates)
+
+        return play_playlist_by_id(choice.get('id'), choice.get('name'), handler_input)
 
 
 class NaviSonicFindPlaylist(AbstractRequestHandler):
@@ -1731,6 +1885,8 @@ sb.add_request_handler(NaviSonicPlaySongByArtist())
 sb.add_request_handler(NaviSonicPlayPlaylist())
 sb.add_request_handler(NaviSonicListPlaylists())
 sb.add_request_handler(NaviSonicHearMorePlaylists())
+sb.add_request_handler(NaviSonicListPlaylistsInGroup())
+sb.add_request_handler(NaviSonicPlayPlaylistInGroup())
 sb.add_request_handler(NaviSonicFindPlaylist())
 sb.add_request_handler(NaviSonicPlayFavouriteSongs())
 sb.add_request_handler(NaviSonicPlayMusicByGenre())

@@ -244,6 +244,43 @@
                         "I need help with {topic}",
                         "{topic}"
                     ]
+                },
+                {
+                    "name": "NaviSonicListPlaylistsInGroup",
+                    "slots": [
+                        {
+                            "name": "group",
+                            "type": "playlist_group"
+                        }
+                    ],
+                    "samples": [
+                        "what {group} playlists do I have",
+                        "what {group} playlists are there",
+                        "what {group} playlists are available",
+                        "list my {group} playlists",
+                        "list the {group} playlists",
+                        "which {group} playlists do I have",
+                        "tell me my {group} playlists"
+                    ]
+                },
+                {
+                    "name": "NaviSonicPlayPlaylistInGroup",
+                    "slots": [
+                        {
+                            "name": "group",
+                            "type": "playlist_group"
+                        }
+                    ],
+                    "samples": [
+                        "play a {group} playlist",
+                        "play an {group} playlist",
+                        "play me a {group} playlist",
+                        "play me an {group} playlist",
+                        "play a random {group} playlist",
+                        "play one of my {group} playlists",
+                        "pick a {group} playlist",
+                        "put on a {group} playlist"
+                    ]
                 }
             ],
             "types": [
@@ -281,6 +318,134 @@
                                     "controlling playback",
                                     "control playback"
                                 ]
+                            }
+                        }
+                    ]
+                },
+                {
+                    "name": "playlist_group",
+                    "values": [
+                        {
+                            "name": {
+                                "value": "Alternative",
+                                "synonyms": [
+                                    "alt",
+                                    "alt rock"
+                                ]
+                            }
+                        },
+                        {
+                            "name": {
+                                "value": "Blues"
+                            }
+                        },
+                        {
+                            "name": {
+                                "value": "Classical"
+                            }
+                        },
+                        {
+                            "name": {
+                                "value": "Country"
+                            }
+                        },
+                        {
+                            "name": {
+                                "value": "Dance"
+                            }
+                        },
+                        {
+                            "name": {
+                                "value": "Electronic",
+                                "synonyms": [
+                                    "electronica",
+                                    "EDM"
+                                ]
+                            }
+                        },
+                        {
+                            "name": {
+                                "value": "Folk"
+                            }
+                        },
+                        {
+                            "name": {
+                                "value": "Funk"
+                            }
+                        },
+                        {
+                            "name": {
+                                "value": "Hip-Hop",
+                                "synonyms": [
+                                    "hip hop",
+                                    "rap"
+                                ]
+                            }
+                        },
+                        {
+                            "name": {
+                                "value": "Indie"
+                            }
+                        },
+                        {
+                            "name": {
+                                "value": "Jazz"
+                            }
+                        },
+                        {
+                            "name": {
+                                "value": "Metal",
+                                "synonyms": [
+                                    "heavy metal"
+                                ]
+                            }
+                        },
+                        {
+                            "name": {
+                                "value": "Pop"
+                            }
+                        },
+                        {
+                            "name": {
+                                "value": "Punk"
+                            }
+                        },
+                        {
+                            "name": {
+                                "value": "R&B",
+                                "synonyms": [
+                                    "R and B",
+                                    "rhythm and blues"
+                                ]
+                            }
+                        },
+                        {
+                            "name": {
+                                "value": "Radio",
+                                "synonyms": [
+                                    "radio station",
+                                    "station"
+                                ]
+                            }
+                        },
+                        {
+                            "name": {
+                                "value": "Reggae"
+                            }
+                        },
+                        {
+                            "name": {
+                                "value": "Rock"
+                            }
+                        },
+                        {
+                            "name": {
+                                "value": "Soul"
+                            }
+                        },
+                        {
+                            "name": {
+                                "value": "Soundtrack"
                             }
                         }
                     ]

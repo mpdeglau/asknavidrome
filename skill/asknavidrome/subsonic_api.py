@@ -174,7 +174,7 @@ class SubsonicConnection:
 
         return self.conn.getPlaylists()['playlists']['playlist']
 
-    def rank_playlists(self, term: str) -> list:
+    def rank_playlists(self, term: str, name_forms=None) -> list:
         """Score every playlist's name against `term`, best match first.
 
         Used instead of a plain first-match search so callers can tell an
@@ -183,6 +183,10 @@ class SubsonicConnection:
         decide whether to just play it or ask which one was meant.
 
         :param str term: The playlist name as spoken/transcribed
+        :param name_forms: Optional callable returning every form of a stored
+            name a user might say (e.g. without its genre prefix); each
+            playlist scores as its best-matching form. Defaults to the stored
+            name only.
         :return: A list of (score, id, name) tuples sorted by score descending
         :rtype: list
         """
@@ -195,23 +199,28 @@ class SubsonicConnection:
 
         for item in self.get_all_playlists():
             name = item.get('name')
-            normalized_name = self._normalize_playlist_name(name)
+            forms = name_forms(name) if name_forms else [name]
 
-            if normalized_name == normalized_term:
-                score = 1.0
-            elif normalized_term and normalized_term in normalized_name:
-                # A stylized name containing the whole spoken term (e.g.
-                # "crossover" inside "FM-X (The Cross-Over)") is a strong
-                # signal, but not quite as certain as an exact match.
-                score = 0.9
-            else:
-                score = difflib.SequenceMatcher(None, normalized_term, normalized_name).ratio()
+            score = max(self._score_playlist_name(normalized_term, form) for form in forms)
 
             scored.append((score, item.get('id'), name))
 
         scored.sort(key=lambda entry: entry[0], reverse=True)
 
         return scored
+
+    def _score_playlist_name(self, normalized_term: str, name: str) -> float:
+        normalized_name = self._normalize_playlist_name(name)
+
+        if normalized_name == normalized_term:
+            return 1.0
+        if normalized_term and normalized_term in normalized_name:
+            # A stylized name containing the whole spoken term (e.g.
+            # "crossover" inside "FM-X (The Cross-Over)") is a strong
+            # signal, but not quite as certain as an exact match.
+            return 0.9
+
+        return difflib.SequenceMatcher(None, normalized_term, normalized_name).ratio()
 
     def search_playlists_by_keyword(self, term: str, limit: int = 5) -> list:
         """Search playlist names and descriptions for a mood/genre/keyword
