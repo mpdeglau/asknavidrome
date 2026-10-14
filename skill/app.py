@@ -8,6 +8,8 @@ from multiprocessing.managers import BaseManager
 import os
 import random
 import sys
+import json
+import urllib.request
 
 from werkzeug.exceptions import BadRequest, MethodNotAllowed, NotFound
 
@@ -24,6 +26,7 @@ import asknavidrome.subsonic_api as api
 import asknavidrome.media_queue as queue
 import asknavidrome.controller as controller
 import asknavidrome.playlist_names as playlist_naming
+from asknavidrome.track import Track
 
 
 def resolved_slot_value(slot):
@@ -1503,6 +1506,74 @@ class NaviSonicUnstarSong(AbstractRequestHandler):
 #
 
 
+RADIO_TOKEN_PREFIX = 'radio:'
+
+
+def radio_stream_url(station: str) -> Union[str, None]:
+    """Return the live stream URL for a radio station, or None if not configured.
+
+    Only one station for now: NAVI_RADIO_URL (the secret-path URL of the radio
+    engine's stream).
+    """
+    return os.getenv('NAVI_RADIO_URL') or None
+
+
+def radio_is_playing(handler_input: HandlerInput) -> bool:
+    """True if the device's current AudioPlayer stream is a radio station."""
+    try:
+        token = handler_input.request_envelope.context.audio_player.token
+    except AttributeError:
+        return False
+    return bool(token) and token.startswith(RADIO_TOKEN_PREFIX)
+
+
+class NaviSonicPlayRadio(AbstractRequestHandler):
+    """Handle the NaviSonicPlayRadio intent
+
+    Play the radio station: one endless stream, so there is no queue to skip through.
+    """
+
+    def can_handle(self, handler_input: HandlerInput) -> bool:
+        return is_intent_name('NaviSonicPlayRadio')(handler_input)
+
+    def handle(self, handler_input: HandlerInput) -> Response:
+        logger.debug('In NaviSonicPlayRadio')
+
+        url = radio_stream_url('radio')
+        if url is None:
+            text = sanitise_speech_output("The radio station isn't set up yet.")
+            handler_input.response_builder.speak(text)
+            return handler_input.response_builder.response
+
+        device_id = get_device_id(handler_input)
+        existing_process = background_processes.get(device_id)
+        if existing_process is not None:
+            existing_process.terminate()
+            existing_process.join()
+        start_new_queue(device_id, get_play_queue(handler_input))
+        queue_descriptions[device_id] = 'the radio'
+
+        speech = sanitise_speech_output('Tuning in to the radio')
+        card = {'title': 'AskNavidrome', 'text': speech}
+        station = Track(id=RADIO_TOKEN_PREFIX + 'radio', title='Radio', artist='Live radio', uri=url)
+        return controller.start_playback('play', speech, card, station, handler_input)
+
+
+class RadioIgnoreSkipHandler(AbstractRequestHandler):
+    """Next / Previous while a radio station is playing: it's live, so do nothing."""
+
+    def can_handle(self, handler_input: HandlerInput) -> bool:
+        return ((is_intent_name('AMAZON.NextIntent')(handler_input) or
+                 is_request_type('PlaybackController.NextCommandIssued')(handler_input) or
+                 is_intent_name('AMAZON.PreviousIntent')(handler_input) or
+                 is_request_type('PlaybackController.PreviousCommandIssued')(handler_input))
+                and radio_is_playing(handler_input))
+
+    def handle(self, handler_input: HandlerInput) -> Response:
+        logger.debug('In RadioIgnoreSkipHandler')
+        return handler_input.response_builder.response
+
+
 class PlaybackStartedHandler(AbstractRequestHandler):
     """AudioPlayer.PlaybackStarted Directive received.
 
@@ -1521,8 +1592,9 @@ class PlaybackStartedHandler(AbstractRequestHandler):
         # Navidrome track ID (see controller.start_playback). Never let this
         # break playback.
         try:
-            connection.now_playing(handler_input.request_envelope.request.token,
-                                   get_device_id(handler_input))
+            if not str(handler_input.request_envelope.request.token).startswith(RADIO_TOKEN_PREFIX):
+                connection.now_playing(handler_input.request_envelope.request.token,
+                                       get_device_id(handler_input))
         except Exception as e:
             logger.warning(f'Failed to report now playing to Navidrome: {e}')
 
@@ -1892,6 +1964,8 @@ sb.add_request_handler(NaviSonicPlayFavouriteSongs())
 sb.add_request_handler(NaviSonicPlayMusicByGenre())
 sb.add_request_handler(NaviSonicPlayMusicRandom())
 sb.add_request_handler(NaviSonicRandomiseQueue())
+sb.add_request_handler(NaviSonicPlayRadio())
+sb.add_request_handler(RadioIgnoreSkipHandler())
 sb.add_request_handler(NaviSonicSongDetails())
 sb.add_request_handler(NaviSonicStarSong())
 sb.add_request_handler(NaviSonicUnstarSong())
@@ -1988,7 +2062,18 @@ def playback_status():
             'queue_length': device_queue.get_queue_count(),
         })
 
-    return {'devices': devices}
+    status = {'devices': devices}
+
+    # Radio station status, relayed from the radio brain so Home Assistant needs only this one endpoint.
+    radio_status_url = os.getenv('NAVI_RADIO_STATUS_URL')
+    if radio_status_url:
+        try:
+            with urllib.request.urlopen(radio_status_url, timeout=3) as resp:
+                status['radio'] = json.load(resp)
+        except Exception as e:
+            logger.warning(f'Radio status unavailable: {e}')
+
+    return status
 
 
 # Enable queue and history diagnostics

@@ -281,6 +281,18 @@
                         "pick a {group} playlist",
                         "put on a {group} playlist"
                     ]
+                },
+                {
+                    "name": "NaviSonicPlayRadio",
+                    "slots": [],
+                    "samples": [
+                        "Play the radio",
+                        "Play radio",
+                        "Tune in to the radio",
+                        "Play the radio station",
+                        "Turn on the radio",
+                        "Start the radio"
+                    ]
                 }
             ],
             "types": [
