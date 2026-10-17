@@ -75,7 +75,10 @@ config, and deploying the Alexa skill. The changes below aren't reflected there 
   `NAVI_RADIO_STATIONS_URL` + `/` + its id. Unset, or for a station that isn't configured, the skill says so; a spoken
   name the slot type doesn't know gets "I don't know that radio station". Because the stream is live there's nothing to
   skip: while it plays, Next and Previous (voice or remote) are ignored. The stream is identified by its AudioPlayer
-  token (`radio:<station id>`), which also keeps it from being reported to Navidrome's now-playing list. To add a
+  token (`radio:<station id>`), which also keeps it from being reported to Navidrome's now-playing list or scrobbled.
+  The station is kept as the device's current track, so after "stop" or "pause", "play" or "resume" tunes back in to
+  the same station, always from the live point (a stream has no position to return to). The device's playback state
+  is held in memory, so a restart of the skill container forgets what was playing. To add a
   station, add an entity (id = the stream's last path segment) to the `radio_station` type in `alexa.json` and upload
   and build the model in the Alexa developer console.
 - **Radio status in `/status`.** If `NAVI_RADIO_STATUS_URL` is set, `/status` also returns a `radio` object copied
