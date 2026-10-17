@@ -52,6 +52,18 @@ class MediaQueue:
         """
         return self.current_track
 
+    def set_current_track(self, track: Track) -> None:
+        """Make a track the current one without queueing it
+
+        Used for live radio: the stream is not part of a queue, but being the
+        current track lets stop / resume find it again.
+
+        :param Track track: The track to make current
+        :return: None
+        """
+
+        self.current_track = track
+
     def set_current_track_offset(self, offset: int) -> None:
         """Method to set the offset of the current track in milliseconds
 

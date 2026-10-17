@@ -67,14 +67,17 @@ config, and deploying the Alexa skill. The changes below aren't reflected there 
   | `NAVI_PLAYLIST_QUALIFIED_FORMAT` | `{group} {name}` | How it's spoken when its spoken form would clash with another playlist's. |
 
   In a Compose file, write `$` in the pattern as `$$`.
-- **Live radio station.** `NaviSonicPlayRadio` ("Alexa, ask my music to play the radio" / "tune in to the radio")
-  plays one endless stream instead of a queue of tracks. The stream URL comes from `NAVI_RADIO_URL` (any HTTPS audio
-  stream, such as a Liquidsoap or Icecast mount); unset, the skill answers that the radio isn't set up. Because the
-  stream is live there's nothing to skip: while it plays, Next and Previous (voice or remote) are ignored. The stream
-  is identified by its AudioPlayer token (`radio:radio`), which also keeps it from being reported to Navidrome's
-  now-playing list. Only one station is supported, with a fixed generic name ("Radio"); station names aren't spoken
-  or selectable yet. The interaction model (`alexa.json`) needs the new intent and its sample utterances uploaded and
-  built in the Alexa developer console.
+- **Live radio stations.** `NaviSonicPlayRadio` ("Alexa, ask my music to play the radio" / "tune in to the radio")
+  plays an endless stream instead of a queue of tracks. With no station named it plays the default station, whose URL
+  comes from `NAVI_RADIO_URL` (any HTTPS audio stream, such as a Liquidsoap or Icecast mount). Naming a station
+  ("play the grunge station", "tune in to new country radio") picks it through the `station` slot (custom type
+  `radio_station`, entity ids are the station ids); the default station has the id `pit`, every other station's stream is
+  `NAVI_RADIO_STATIONS_URL` + `/` + its id. Unset, or for a station that isn't configured, the skill says so; a spoken
+  name the slot type doesn't know gets "I don't know that radio station". Because the stream is live there's nothing to
+  skip: while it plays, Next and Previous (voice or remote) are ignored. The stream is identified by its AudioPlayer
+  token (`radio:<station id>`), which also keeps it from being reported to Navidrome's now-playing list. To add a
+  station, add an entity (id = the stream's last path segment) to the `radio_station` type in `alexa.json` and upload
+  and build the model in the Alexa developer console.
 - **Radio status in `/status`.** If `NAVI_RADIO_STATUS_URL` is set, `/status` also returns a `radio` object copied
   from that URL (a JSON document, fetched with a 3 second timeout; failures are logged and the key is left out). The
   radio service used here publishes the listener count and what is on air, so Home Assistant needs only this one

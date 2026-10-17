@@ -284,14 +284,27 @@
                 },
                 {
                     "name": "NaviSonicPlayRadio",
-                    "slots": [],
+                    "slots": [
+                        {
+                            "name": "station",
+                            "type": "radio_station"
+                        }
+                    ],
                     "samples": [
                         "Play the radio",
                         "Play radio",
                         "Tune in to the radio",
                         "Play the radio station",
                         "Turn on the radio",
-                        "Start the radio"
+                        "Start the radio",
+                        "Play the {station} station",
+                        "Play the {station} radio station",
+                        "Play {station} radio",
+                        "Tune in to {station} radio",
+                        "Tune in to the {station} station",
+                        "Play the radio station {station}",
+                        "Start the {station} station",
+                        "Turn on {station} radio"
                     ]
                 }
             ],
@@ -458,6 +471,85 @@
                         {
                             "name": {
                                 "value": "Soundtrack"
+                            }
+                        }
+                    ]
+                },
+                {
+                    "name": "radio_station",
+                    "values": [
+                        {
+                            "id": "pit",
+                            "name": {
+                                "value": "The Pit",
+                                "synonyms": [
+                                    "pit",
+                                    "the pit",
+                                    "94.5",
+                                    "rock",
+                                    "the rock"
+                                ]
+                            }
+                        },
+                        {
+                            "id": "new-country",
+                            "name": {
+                                "value": "New Country",
+                                "synonyms": [
+                                    "country",
+                                    "modern country",
+                                    "new country music"
+                                ]
+                            }
+                        },
+                        {
+                            "id": "grunge",
+                            "name": {
+                                "value": "Grunge",
+                                "synonyms": [
+                                    "seattle",
+                                    "seattle grunge",
+                                    "grunge rock"
+                                ]
+                            }
+                        },
+                        {
+                            "id": "90s-alternative",
+                            "name": {
+                                "value": "90s Alternative",
+                                "synonyms": [
+                                    "nineties alternative",
+                                    "90s alt",
+                                    "nineties alt",
+                                    "alternative",
+                                    "90s",
+                                    "nineties"
+                                ]
+                            }
+                        },
+                        {
+                            "id": "classic-rock",
+                            "name": {
+                                "value": "Classic Rock",
+                                "synonyms": [
+                                    "classic",
+                                    "old rock",
+                                    "classic rock and roll"
+                                ]
+                            }
+                        },
+                        {
+                            "id": "80s-new-wave",
+                            "name": {
+                                "value": "80s New Wave",
+                                "synonyms": [
+                                    "new wave",
+                                    "eighties new wave",
+                                    "eighties",
+                                    "80s",
+                                    "synth pop",
+                                    "eighties synth pop"
+                                ]
                             }
                         }
                     ]

@@ -1,6 +1,6 @@
 from datetime import datetime
 from flask import Flask, render_template, request
-from typing import Union
+from typing import Tuple, Union
 import hmac
 import logging
 from multiprocessing import Process
@@ -1507,15 +1507,41 @@ class NaviSonicUnstarSong(AbstractRequestHandler):
 
 
 RADIO_TOKEN_PREFIX = 'radio:'
+RADIO_DEFAULT_STATION = 'pit'
 
 
 def radio_stream_url(station: str) -> Union[str, None]:
     """Return the live stream URL for a radio station, or None if not configured.
 
-    Only one station for now: NAVI_RADIO_URL (the secret-path URL of the radio
-    engine's stream).
+    The default station (RADIO_DEFAULT_STATION) is NAVI_RADIO_URL, the secret-path
+    URL of the radio engine's stream. Every other station is NAVI_RADIO_STATIONS_URL
+    (the secret-path prefix of the station streams) followed by the station id.
     """
-    return os.getenv('NAVI_RADIO_URL') or None
+    if station == RADIO_DEFAULT_STATION:
+        return os.getenv('NAVI_RADIO_URL') or None
+    base = os.getenv('NAVI_RADIO_STATIONS_URL')
+    return base.rstrip('/') + '/' + station if base else None
+
+
+def requested_radio_station(handler_input: HandlerInput) -> Union[Tuple[str, str], None]:
+    """Return (station id, spoken name) for the optional station slot.
+
+    No station spoken means the default station ("the radio"). None means a
+    station was spoken that the slot type does not know.
+    """
+    slot = get_slot_value_v2(handler_input, 'station')
+    if slot is None or not slot.value:
+        return RADIO_DEFAULT_STATION, 'the radio'
+    if slot.resolutions and slot.resolutions.resolutions_per_authority:
+        for authority in slot.resolutions.resolutions_per_authority:
+            # The SDK deserialises the status code as an enum and the value as a plain dict
+            code = getattr(authority.status.code, 'value', authority.status.code)
+            if code == 'ER_SUCCESS_MATCH' and authority.values:
+                value = authority.values[0].value
+                if isinstance(value, dict):
+                    return value.get('id'), value.get('name')
+                return value.id, value.name
+    return None
 
 
 def radio_is_playing(handler_input: HandlerInput) -> bool:
@@ -1530,7 +1556,8 @@ def radio_is_playing(handler_input: HandlerInput) -> bool:
 class NaviSonicPlayRadio(AbstractRequestHandler):
     """Handle the NaviSonicPlayRadio intent
 
-    Play the radio station: one endless stream, so there is no queue to skip through.
+    Play a radio station (the default one, or the one named in the station slot):
+    one endless stream, so there is no queue to skip through.
     """
 
     def can_handle(self, handler_input: HandlerInput) -> bool:
@@ -1539,9 +1566,16 @@ class NaviSonicPlayRadio(AbstractRequestHandler):
     def handle(self, handler_input: HandlerInput) -> Response:
         logger.debug('In NaviSonicPlayRadio')
 
-        url = radio_stream_url('radio')
+        requested = requested_radio_station(handler_input)
+        if requested is None:
+            text = sanitise_speech_output("I don't know that radio station.")
+            handler_input.response_builder.speak(text)
+            return handler_input.response_builder.response
+        station_id, station_name = requested
+
+        url = radio_stream_url(station_id)
         if url is None:
-            text = sanitise_speech_output("The radio station isn't set up yet.")
+            text = sanitise_speech_output("That radio station isn't set up yet.")
             handler_input.response_builder.speak(text)
             return handler_input.response_builder.response
 
@@ -1550,12 +1584,15 @@ class NaviSonicPlayRadio(AbstractRequestHandler):
         if existing_process is not None:
             existing_process.terminate()
             existing_process.join()
-        start_new_queue(device_id, get_play_queue(handler_input))
-        queue_descriptions[device_id] = 'the radio'
+        play_queue = get_play_queue(handler_input)
+        start_new_queue(device_id, play_queue)
+        queue_descriptions[device_id] = station_name
 
-        speech = sanitise_speech_output('Tuning in to the radio')
+        speech = sanitise_speech_output(f'Tuning in to {station_name}')
         card = {'title': 'AskNavidrome', 'text': speech}
-        station = Track(id=RADIO_TOKEN_PREFIX + 'radio', title='Radio', artist='Live radio', uri=url)
+        station = Track(id=RADIO_TOKEN_PREFIX + station_id, title=station_name, artist='Live radio', uri=url)
+        # Stop and resume look for the current track, so the stream has to be it
+        play_queue.set_current_track(station)
         return controller.start_playback('play', speech, card, station, handler_input)
 
 
@@ -1668,6 +1705,8 @@ class PlaybackFinishedHandler(AbstractRequestHandler):
         # Generate a timestamp in milliseconds for scrobbling
         timestamp_ms = datetime.now().timestamp()
         current_track = play_queue.get_current_track()
+        if current_track.id and current_track.id.startswith(RADIO_TOKEN_PREFIX):
+            return handler_input.response_builder.response    # a live stream has nothing to scrobble or advance
         connection.scrobble(current_track.id, timestamp_ms)
         play_queue.get_next_track()
 
@@ -1715,6 +1754,13 @@ class ResumePlaybackHandler(AbstractRequestHandler):
             text = sanitise_speech_output(f'Now playing {description}')
         else:
             text = None
+
+        if current_track.id and current_track.id.startswith(RADIO_TOKEN_PREFIX):
+            # A live stream has no position to return to: tune back in
+            current_track.offset = 0
+            logger.info('Resuming radio ' + str(current_track.title))
+
+            return controller.start_playback('play', text, None, current_track, handler_input)
 
         if current_track.offset > 0:
             # There is a paused track, continue
